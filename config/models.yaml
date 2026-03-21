@@ -1,0 +1,115 @@
+# models.yaml — all model configuration
+# Change a model, port, or quant: edit here only. No code changes required.
+# Thinking mode and budget_tokens are per-call overrides; defaults set here.
+
+models:
+
+  # ── Qwen3.5-9B Q6_K (bartowski) ─────────────────────────────────────────
+  # Roles: vision decode, scaffold+plan (thinking), critic_a, validate
+  # Hot-loaded throughout; never swapped out
+  9b:
+    name:        "Qwen3.5-9B"
+    quant:       "Q6_K"
+    source:      "bartowski"
+    port:        8081
+    base_url:    "http://localhost:8081/v1"
+    model_id:    "qwen3.5-9b-q6_k"          # as registered with llama.cpp server
+    context_len: 32768
+    thinking:
+      default_on: false                      # overridden per call
+      budget_tokens: 4096                    # max thinking tokens when ON
+    temperature: 0.6
+    top_p:       0.95
+
+  # ── Qwen3.5-27B IQ2_S (bartowski) ───────────────────────────────────────
+  # Roles: ideation (long mode only)
+  # Loaded on demand; unloaded after ideation stage
+  27b:
+    name:        "Qwen3.5-27B"
+    quant:       "IQ2_S"
+    source:      "bartowski"
+    port:        8082
+    base_url:    "http://localhost:8082/v1"
+    model_id:    "qwen3.5-27b-iq2_s"
+    context_len: 16384
+    thinking:
+      default_on: false
+      budget_tokens: 0
+    temperature: 0.8                         # slightly higher for ideation breadth
+    top_p:       0.95
+
+  # ── Qwen3.5-35B MoE UD-Q4_K_XL (unsloth) ───────────────────────────────
+  # Roles: draft generation (long mode), synthesis (complex tasks)
+  # Loaded on demand; heaviest model
+  35b:
+    name:        "Qwen3.5-35B-MoE"
+    quant:       "UD-Q4_K_XL"
+    source:      "unsloth"
+    port:        8083
+    base_url:    "http://localhost:8083/v1"
+    model_id:    "qwen3.5-35b-moe-ud-q4_k_xl"
+    context_len: 65536
+    thinking:
+      default_on: true
+      budget_tokens: 8192                    # architecture pass; component fill disables
+    temperature: 0.6
+    top_p:       0.95
+    nowait_tokens:                           # logit bias token IDs for NoWait suppression
+      # Derive empirically via 32-sample analysis; these are starting defaults for Qwen3.5
+      # Format: token_id: bias_value (large negative = suppress)
+      # Placeholder — replace with actual token IDs from your model's tokeniser
+      # Run: python tools/derive_nowait_tokens.py --model 35b --samples 32
+      _note: "Run tools/derive_nowait_tokens.py to populate this section"
+
+  # ── DeepCoder 14B Q4_K_M (bartowski) ────────────────────────────────────
+  # Roles: correctness appraisal, critic_b (ensemble)
+  # Loaded on demand
+  deepcoder:
+    name:        "DeepCoder-14B"
+    quant:       "Q4_K_M"
+    source:      "bartowski"
+    port:        8084
+    base_url:    "http://localhost:8084/v1"
+    model_id:    "deepcoder-14b-q4_k_m"
+    context_len: 32768
+    thinking:
+      default_on: true
+      budget_tokens: 4096
+    temperature: 0.4                         # lower for correctness checking
+    top_p:       0.9
+
+  # ── Qwen2.5 Coder 14B Instruct Q4_K_M (unsloth) ─────────────────────────
+  # Roles: bug fix pass, critic_a craft review
+  # Loaded on demand; may coexist with deepcoder during ensemble
+  coder14b:
+    name:        "Qwen2.5-Coder-14B-Instruct"
+    quant:       "Q4_K_M"
+    source:      "unsloth"
+    port:        8085
+    base_url:    "http://localhost:8085/v1"
+    model_id:    "qwen2.5-coder-14b-instruct-q4_k_m"
+    context_len: 32768
+    thinking:
+      default_on: false
+      budget_tokens: 0
+    temperature: 0.3                         # low for precise repair
+    top_p:       0.9
+
+
+# ── Role → model mapping ─────────────────────────────────────────────────────
+# Change which model handles which role without touching code.
+roles:
+  vision_decode:     "9b"
+  classify:          "9b"
+  ideation:          "27b"
+  plan:              "9b"
+  draft_long:        "35b"
+  draft_short:       "9b"        # short mode executor
+  appraise:          "deepcoder"
+  bugfix:            "coder14b"
+  critic_a:          "9b"
+  critic_b:          "deepcoder"
+  synthesis_complex: "35b"
+  synthesis_simple:  "9b"
+  validate:          "9b"
+  final_validate:    "9b"

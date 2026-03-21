@@ -1,0 +1,74 @@
+# routing.yaml — all routing rules, thresholds, and weights
+# No routing logic lives in code. Change behaviour by editing here.
+
+# ── Correction loop ──────────────────────────────────────────────────────────
+correction_loop:
+  max_iterations:        4      # After this many iterations, return unresolvable
+  # Per mode: where does minor_fix route?
+  minor_fix_target:
+    long:  "draft"              # Re-route to 35B for full redraft
+    short: "bugfix"             # Re-route to coder14b for in-place fix
+
+# ── Ensemble triggers ────────────────────────────────────────────────────────
+ensemble:
+  enabled:              true    # Master switch; false = never run ensemble
+  trigger_on_complexity:        # Run ensemble when complexity meets threshold
+    - "complex"
+  trigger_on_mode:
+    - "long"
+  always_run_critic_a:  true    # 9B coherence always runs if ensemble fires
+  run_critic_b:         true    # DeepCoder correctness — optional
+  # Final iteration behaviour: always run full ensemble before giving up
+  force_on_final_iteration: true
+
+# ── Sub-spec decomposition ───────────────────────────────────────────────────
+decomposition:
+  max_components_before_decompose: 5    # Decompose if plan has > N independent components
+  max_component_token_estimate:   500   # Decompose if any single component desc > N tokens
+  max_sub_specs:                  20    # Safety cap on number of sub-specs
+
+# ── Lesson retrieval (LessonL) ───────────────────────────────────────────────
+lesson_retrieval:
+  enabled:         true         # Phase 1: store-only (retrieval off until min_lessons met)
+  inject_enabled:  true         # Phase 2: set to true after sufficient lessons accumulated
+  min_lessons_for_inject: 50    # Don't inject until this many lessons exist in store
+  top_k:           5            # Maximum lessons to inject per planning prompt
+  min_score:       0.2          # Minimum composite score to include a lesson
+  # Scoring weights — must sum to 1.0
+  weights:
+    confidence:  0.4
+    recency:     0.3
+    similarity:  0.2
+    difficulty:  0.1
+  # Recency decay: score = 1 / (1 + days_since_last_triggered * decay_rate)
+  recency_decay_rate: 0.05
+  # Deduplication: lessons with similarity above this threshold merge rather than duplicate
+  dedup_threshold: 0.85
+  # Meta-distillation: consolidate after this many runs
+  meta_distill_every_n_runs: 50
+
+# ── LLMLingua-2 compression ──────────────────────────────────────────────────
+compression:
+  enabled:              true
+  # Compression targets and ratios (never compress code)
+  ideation_ratio:       0.5     # Compress IdeationOutput to 50% of tokens
+  correction_history_ratio: 0.4 # Compress accumulated verdict/feedback history
+  min_tokens_to_compress: 200   # Don't compress if content is below this token count
+  # Quality guard: if compression confidence drops below this, skip compression
+  min_confidence:       0.7
+
+# ── Short mode executor ──────────────────────────────────────────────────────
+short_mode:
+  rapid_executor:       "9b_nonthinking"   # fastest path: 9B non-thinking
+  careful_executor:     "9b_thinking"      # slower but more accurate
+
+# ── Synthesis model selection ────────────────────────────────────────────────
+synthesis:
+  complex_threshold:    "complex"   # Use 35B for synthesis when complexity >= this
+  # If 35B is not loaded and synthesis needed, fall back to 9B
+  fallback_to_9b_if_35b_unloaded: true
+
+# ── Final validation ─────────────────────────────────────────────────────────
+final_validation:
+  # Escalate to 35B for final validation if assembled project exceeds this token estimate
+  escalate_to_35b_token_threshold: 12000
