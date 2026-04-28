@@ -16,6 +16,13 @@ from clients.llm import call_role
 from pipeline.state import PipelineState
 from schemas.execution import AppraisalReport
 
+
+def _get_budget(stage: str) -> int:
+    """Read thinking token budget for this stage from routing.yaml."""
+    from clients.llm import _get_thinking_budget
+    return _get_thinking_budget(stage)
+
+
 log = logging.getLogger(__name__)
 
 _SYSTEM = """You are a correctness appraisal model trained on verifiable coding problems.
@@ -35,16 +42,15 @@ For each issue: state the component, severity (critical/major/minor),
 category, clear description, and location if applicable.
 
 Also flag any issues that appear to originate from imprecise ideation
-(far-fetched or inconsistent assumptions baked into the implementation)
-in iq2s_inherited_issues.
+(far-fetched or inconsistent assumptions baked into the implementation).
 
-When your reasoning is complete, emit: <confidence>high</confidence>
-"""
+Reflect your confidence in the `confidence` field. If you are unsure or missing critical information, set confidence to 'low' and write a specific question to the user in `clarification_question`."""
 
 
 def appraise_node(state: PipelineState) -> dict:
     """
-    Appraise the draft for correctness against the PlanSpec.
+    Generate AppraisalReport from DraftOutput.
+    Evaluates execution correctness against the PlanSpec.
     Writes appraisal_report.json to disk.
     """
     run_dir = state["run_dir"]
@@ -72,8 +78,16 @@ def appraise_node(state: PipelineState) -> dict:
         stage           = "appraise",
         run_dir         = run_dir,
         thinking        = True,
-        budget_tokens   = 4096,
+        budget_tokens   = _get_budget("appraise"),
+        max_retries     = 0,
     )
+
+    if report.confidence == "low" and report.clarification_question:
+        log.warning("Appraiser halted — needs human input: %s", report.clarification_question)
+        return {
+            "pipeline_halted": True,
+            "clarification_needed": report.clarification_question
+        }
 
     log.info(
         "Appraisal: %s satisfaction | critical=%d major=%d minor=%d | iq2s=%d",

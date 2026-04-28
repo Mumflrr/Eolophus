@@ -46,9 +46,19 @@ from pipeline.routers import (
     route_after_sub_specs,
     route_after_final_validate,
 )
+from nodes.describe import describe_node
+
+
 
 log = logging.getLogger(__name__)
 
+
+def clarify_node(state):
+    return {
+        "pipeline_failed":  True,
+        "failure_reason":   state.get("clarification_question", "Clarification needed."),
+        "pipeline_complete": True,
+    }
 
 # ── Sub-spec runner node ──────────────────────────────────────────────────────
 
@@ -198,6 +208,7 @@ def get_graph():
     builder.add_node("validate",        validate_node)
     builder.add_node("sub_spec_runner", sub_spec_runner_node)
     builder.add_node("final_validate",  final_validate_node)
+    builder.add_node("describe",        describe_node)
 
     # ── Entry point ───────────────────────────────────────────────────────────
     builder.set_conditional_entry_point(
@@ -216,14 +227,12 @@ def get_graph():
     )
 
     # ── Classify → ideation or plan ───────────────────────────────────────────
-    builder.add_conditional_edges(
-        "classify",
-        route_after_classify,
-        {
-            "ideation": "ideation",
-            "plan":     "plan",
-        },
-    )
+    builder.add_conditional_edges("classify", route_after_classify, {
+        "describe":  "describe",
+        "clarify":   "clarify",
+        "ideation":  "ideation",
+        "plan":      "plan",
+    })
 
     # ── Ideation → plan ───────────────────────────────────────────────────────
     builder.add_conditional_edges(
@@ -326,6 +335,10 @@ def get_graph():
         {"end": END},
     )
 
+    builder.add_edge("describe", END)
+    builder.add_node("clarify", clarify_node)
+    builder.add_edge("clarify", END)
+
     # ── Compile with Langfuse callback ────────────────────────────────────────
     callbacks = _build_callbacks()
     app = builder.compile()
@@ -338,15 +351,22 @@ def _build_callbacks() -> list:
     """Build Langfuse callback handler if configured."""
     callbacks = []
     try:
-        from langfuse.callback import CallbackHandler
+        from langfuse.langchain import CallbackHandler
+        import os
+        
+        # 1. Fallback to localhost if not in your .env, and forcefully set it in os.environ
         langfuse_host = os.environ.get("LANGFUSE_HOST", "http://localhost:3000")
-        handler = CallbackHandler(host=langfuse_host)
+        os.environ["LANGFUSE_HOST"] = langfuse_host
+        
+        # 2. Initialize with NO arguments (Langfuse v3/v4 requirement)
+        handler = CallbackHandler()
+        
         callbacks.append(handler)
         log.info("Langfuse callback attached at %s", langfuse_host)
-    except ImportError:
+    except ImportError as e:
         log.warning(
-            "langfuse not installed — tracing disabled. "
-            "pip install langfuse to enable."
+            f"langfuse import failed ({e}) — tracing disabled. "
+            "Make sure you are using 'langfuse.langchain' for v3/v4."
         )
     except Exception as e:
         log.warning("Failed to attach Langfuse callback: %s", e)

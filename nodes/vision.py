@@ -20,7 +20,9 @@ log = logging.getLogger(__name__)
 
 _SYSTEM = """You are analysing a visual input (image) to extract structured information
 for a software development pipeline. Describe everything you can see precisely and completely.
-Pay special attention to UI elements, data flows, component relationships, and any text visible in the image."""
+Pay special attention to UI elements, data flows, component relationships, and any text visible in the image.
+
+Reflect your confidence in the `confidence` field. If the image is blurry, cut off, or you are unsure what it depicts, set confidence to 'low' and write a specific question to the user in `clarification_question`."""
 
 
 def vision_decode_node(state: PipelineState) -> dict:
@@ -42,12 +44,9 @@ def vision_decode_node(state: PipelineState) -> dict:
 
     # Determine image MIME type from extension
     ext = Path(image_path).suffix.lower()
-    mime_map = {
-        ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
-        ".png": "image/png",  ".gif": "image/gif",
-        ".webp": "image/webp",
-    }
-    mime_type = mime_map.get(ext, "image/png")
+    ext = ext[1:] if ext.startswith(".") else "png"
+    if ext == "jpg":
+        ext = "jpeg"
 
     messages = [
         {"role": "system", "content": _SYSTEM},
@@ -56,14 +55,11 @@ def vision_decode_node(state: PipelineState) -> dict:
             "content": [
                 {
                     "type": "image_url",
-                    "image_url": {
-                        "url": f"data:{mime_type};base64,{image_data}"
-                    },
+                    "image_url": {"url": f"data:image/{ext};base64,{image_data}"},
                 },
                 {
                     "type": "text",
                     "text": (
-                        f"Please analyse this image and return a structured VisualDescription.\n"
                         f"Additional context from user: {text_input}"
                         if text_input else
                         "Please analyse this image and return a structured VisualDescription."
@@ -80,7 +76,16 @@ def vision_decode_node(state: PipelineState) -> dict:
         stage           = "vision",
         run_dir         = run_dir,
         thinking        = False,
+        max_retries     = 0,      # <--- Added timeout protection
     )
+
+    # <--- Added Human-in-the-Loop Halting Logic
+    if description.confidence == "low" and description.clarification_question:
+        log.warning("Vision decode halted — needs human input: %s", description.clarification_question)
+        return {
+            "pipeline_halted": True,
+            "clarification_needed": description.clarification_question
+        }
 
     log.info("Vision decode: %s — %d elements, %d requirements",
              description.content_type,

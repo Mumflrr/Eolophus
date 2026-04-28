@@ -22,6 +22,12 @@ from schemas.validation import (
     CritiqueVerdict, CritiqueRecord, CriticScope, VerdictCategory
 )
 
+
+def _get_budget(stage: str) -> int:
+    """Read thinking token budget for this stage from routing.yaml."""
+    from clients.llm import _get_thinking_budget
+    return _get_thinking_budget(stage)
+
 log = logging.getLogger(__name__)
 
 # ── System prompts ────────────────────────────────────────────────────────────
@@ -58,8 +64,6 @@ Evaluate from these angles ONLY:
 
 You are NOT evaluating coding style, idioms, or conventions.
 That is outside your scope here.
-
-When your reasoning is complete, emit: <confidence>high</confidence>
 
 Return a CritiqueVerdict with category:
   pass          — implementation is logically correct and satisfies the spec
@@ -102,6 +106,7 @@ def critic_a_node(state: PipelineState) -> dict:
         stage           = "critic_a",
         run_dir         = run_dir,
         thinking        = False,
+        max_retries     = 0,
     )
 
     # Ensure scope is set correctly
@@ -167,7 +172,8 @@ def critic_b_node(state: PipelineState) -> dict:
         stage           = "critic_b",
         run_dir         = run_dir,
         thinking        = True,
-        budget_tokens   = 4096,
+        budget_tokens   = _get_budget("critic_b"),
+        max_rtreies     = 0,
     )
 
     verdict = verdict.model_copy(update={

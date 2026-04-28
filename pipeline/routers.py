@@ -48,28 +48,6 @@ def route_after_vision(state: PipelineState) -> str:
     return "classify"
 
 
-def route_after_classify(state: PipelineState) -> str:
-    """
-    After task classification:
-    long mode  → ideation (if open-ended) or plan directly
-    short mode → plan
-    """
-    classification = state.get("classification")
-    if not classification:
-        log.warning("Router: no classification found, defaulting to plan")
-        return "plan"
-
-    mode      = getattr(classification, "mode", "short")
-    task_type = getattr(classification, "task_type", "coding")
-
-    if mode == "long" and task_type in ("ideation", "mixed"):
-        log.debug("Router: classify → ideation")
-        return "ideation"
-
-    log.debug("Router: classify → plan")
-    return "plan"
-
-
 def route_after_ideation(state: PipelineState) -> str:
     """After ideation: always → plan."""
     return "plan"
@@ -128,7 +106,18 @@ def route_after_bugfix(state: PipelineState) -> str:
     After bug fix pass:
     ensemble enabled + complexity triggers it → critic_a
     otherwise                                 → validate
+
+    Ensemble is suppressed when:
+      - routing.yaml ensemble.enabled is False
+      - PIPELINE_NO_ENSEMBLE env var is set (from --no-ensemble flag or /no-ensemble prefix)
     """
+    import os
+
+    # Check env var set by --no-ensemble flag or /no-ensemble prefix
+    if os.environ.get("PIPELINE_NO_ENSEMBLE"):
+        log.debug("Router: bugfix → validate (PIPELINE_NO_ENSEMBLE set)")
+        return "validate"
+
     cfg = _cfg()
     ensemble_cfg  = cfg.get("ensemble", {})
 
@@ -234,3 +223,71 @@ def route_after_sub_specs(state: PipelineState) -> str:
 def route_after_final_validate(state: PipelineState) -> str:
     """After final validation: always → end."""
     return "end"
+
+
+def route_after_classify_with_confidence(state) -> str:
+    """
+    Extended route_after_classify that checks confidence first.
+    Drop-in replacement for route_after_classify in graph.py.
+ 
+    Routes:
+      confidence=low + question → "clarify"
+      long + ideation/mixed     → "ideation"
+      all others                → "plan"
+    """
+    import logging
+    log = logging.getLogger(__name__)
+ 
+    # Halt on low confidence before spending any model time
+    confidence = state.get("classifier_confidence", "high")
+    question   = state.get("clarification_question")
+ 
+    if confidence == "low" and question:
+        log.info("Router: classify → clarify (confidence=low, question present)")
+        return "clarify"
+ 
+    classification = state.get("classification")
+    if not classification:
+        return "plan"
+ 
+    mode      = getattr(classification, "mode",      "short")
+    task_type = getattr(classification, "task_type", "coding")
+ 
+    if mode == "long" and task_type in ("ideation", "mixed"):
+        return "ideation"
+ 
+    return "plan"
+ 
+ 
+def route_after_classify(state) -> str:
+    """
+    Main post-classify router. Checks confidence, then task_type.
+    Routes describe tasks directly to describe_node, bypassing plan/draft.
+    """
+    import logging
+    log = logging.getLogger(__name__)
+ 
+    # Halt on low confidence before spending any model time
+    confidence = state.get("classifier_confidence", "high")
+    question   = state.get("clarification_question")
+    if confidence == "low" and question:
+        log.info("Router: classify → clarify (confidence=low)")
+        return "clarify"
+ 
+    classification = state.get("classification")
+    if not classification:
+        return "plan"
+ 
+    mode      = getattr(classification, "mode",      "short")
+    task_type = getattr(classification, "task_type", "coding")
+ 
+    # Describe tasks bypass the entire plan/draft pipeline
+    if task_type == "describe":
+        log.info("Router: classify → describe (task_type=describe)")
+        return "describe"
+ 
+    # Long ideation/mixed fires 27B
+    if mode == "long" and task_type in ("ideation", "mixed"):
+        return "ideation"
+ 
+    return "plan"

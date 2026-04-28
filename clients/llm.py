@@ -49,6 +49,37 @@ def _load_config() -> dict:
     return _config_cache
 
 
+def _get_thinking_budget(stage: str, complexity: str = "moderate") -> int:
+    """
+    Get the thinking token budget for a stage from routing.yaml.
+    Uses complexity-aware nested config: thinking_budgets.<stage>.<complexity>.
+    Falls back to 2048 if not configured.
+    """
+    import yaml as _yaml
+    try:
+        rp = Path(__file__).parent.parent / "config" / "routing.yaml"
+        with open(rp) as f:
+            rcfg = _yaml.safe_load(f)
+        stage_cfg = rcfg.get("thinking_budgets", {}).get(stage, {})
+        if isinstance(stage_cfg, dict):
+            return stage_cfg.get(complexity, stage_cfg.get("moderate", 2048))
+        return int(stage_cfg) if stage_cfg else 2048
+    except Exception:
+        return 2048
+
+
+def _get_http_timeout() -> float:
+    """Read HTTP timeout from routing.yaml. Default 7200s (2 hours)."""
+    import yaml as _yaml
+    try:
+        rp = Path(__file__).parent.parent / "config" / "routing.yaml"
+        with open(rp) as f:
+            rcfg = _yaml.safe_load(f)
+        return float(rcfg.get("http", {}).get("timeout_seconds", 7200))
+    except Exception:
+        return 7200.0
+
+
 def get_model_config(model_id: str) -> dict:
     """Return the config block for a model_id (e.g. '9b', '35b')."""
     cfg = _load_config()
@@ -224,6 +255,82 @@ def _log_stage_entry(
         f.write(json.dumps(entry) + "\n")
 
 
+# ── Streaming completion helper ───────────────────────────────────────────────
+
+def _stream_completion(
+    client,
+    model_id:   str,
+    messages:   list,
+    temp:       float,
+    top_p:      float,
+    extra_body,
+    stage:      str,
+):
+    """
+    Stream a completion, logging progress every 100 tokens.
+    Returns (full_content: str, usage).
+    Prevents the pipeline appearing hung during long think blocks.
+    """
+    chunks     = []
+    token_count= 0
+    in_think   = False
+    think_toks = 0
+    usage      = None
+    last_log   = 0
+
+    try:
+        stream = client.chat.completions.create(
+            model      = model_id,
+            messages   = messages,
+            temperature= temp,
+            top_p      = top_p,
+            extra_body = extra_body,
+            stream     = True,
+        )
+
+        for chunk in stream:
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                text = delta.content
+                chunks.append(text)
+                token_count += 1
+
+                # Track think block
+                combined = "".join(chunks)
+                if "<think>" in combined and not in_think:
+                    in_think = True
+                if in_think and "</think>" not in combined:
+                    think_toks += 1
+
+                # Log progress every 100 tokens
+                if token_count - last_log >= 100:
+                    if in_think and "</think>" not in combined:
+                        log.debug("[%s] thinking... %d tokens", stage, think_toks)
+                    else:
+                        log.debug("[%s] generating... %d tokens", stage, token_count)
+                    last_log = token_count
+
+            # Capture usage from final chunk
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = chunk.usage
+
+    except Exception as e:
+        # Fall back to non-streaming if streaming fails
+        log.warning("[%s] streaming failed (%s), falling back to non-streaming", stage, e)
+        resp = client.chat.completions.create(
+            model      = model_id,
+            messages   = messages,
+            temperature= temp,
+            top_p      = top_p,
+            extra_body = extra_body,
+        )
+        return resp.choices[0].message.content or "", resp.usage
+
+    full_content = "".join(chunks)
+    log.debug("[%s] completed: %d total tokens", stage, token_count)
+    return full_content, usage
+
+
 # ── Core call function ────────────────────────────────────────────────────────
 
 def call_model(
@@ -237,6 +344,7 @@ def call_model(
     compress_system: bool            = False,
     compress_ratio:  float           = 0.5,
     max_retries:     int             = 3,
+    skip_nowait:     bool            = False,
 ) -> T:
     """
     Make a structured model call via Instructor.
@@ -267,12 +375,25 @@ def call_model(
     temp       = cfg.get("temperature", 0.6)
     top_p      = cfg.get("top_p", 0.95)
 
+    # Ensure the model server is running before making the call.
+    # On single-GPU setups this may stop the previous model first.
+    try:
+        from clients.model_manager import ensure_model_loaded
+        ensure_model_loaded(model_id)
+    except Exception as e:
+        log.warning("model_manager.ensure_model_loaded failed: %s — assuming server already running", e)
+
     # Resolve thinking settings
     thinking_default = cfg.get("thinking", {}).get("default_on", False)
     use_thinking     = thinking if thinking is not None else thinking_default
-    tok_budget       = budget_tokens if budget_tokens is not None else (
-        cfg.get("thinking", {}).get("budget_tokens", 2048)
-    )
+    
+    if budget_tokens is not None:
+        tok_budget = budget_tokens
+    else:
+        # Apply the stage-specific budget from routing.yaml. 
+        # This overrides models.yaml defaults!
+        tok_budget = _get_thinking_budget(stage)
+
 
     # Apply LLMLingua-2 compression to system message if requested
     if compress_system:
@@ -288,38 +409,35 @@ def call_model(
     prompt_hash = hashlib.sha256(prompt_str.encode()).hexdigest()[:12]
 
     # Build extra_body for thinking mode and logit bias
+    # Always send thinking parameter explicitly — omitting it lets the model
+    # decide, which causes Qwen3.5 to think by default on every request.
     extra_body: dict[str, Any] = {}
     if use_thinking:
         extra_body["thinking"] = {
-            "type":         "enabled",
-            "budget_tokens": tok_budget,
+            "type":          "enabled",
+            "budget_tokens":  tok_budget,
         }
-    logit_bias = _build_logit_bias(cfg)
+    else:
+        extra_body["thinking"] = {"type": "disabled"}
+    logit_bias = _build_logit_bias(cfg) if not skip_nowait else None
     if logit_bias:
         extra_body["logit_bias"] = logit_bias
 
-    # Instructor client
-    raw_client = OpenAI(base_url=base_url, api_key="local")
+    # Instructor client — long timeout to avoid retry noise during 35B generation
+    _http_timeout = _get_http_timeout()
+    raw_client = OpenAI(base_url=base_url, api_key="local", max_retries=0, timeout=1200.0)
     client     = instructor.from_openai(raw_client, mode=instructor.Mode.JSON)
 
     retries_used = 0
     start_ts     = time.perf_counter()
 
     try:
-        # We call the raw completion first to capture thinking output,
-        # then pass the answer portion to Instructor for schema parsing.
-        # For models without thinking, raw_content == answer.
-
-        raw_resp = raw_client.chat.completions.create(
-            model    = cfg["model_id"],
-            messages = messages,
-            temperature = temp,
-            top_p    = top_p,
-            extra_body = extra_body if extra_body else None,
+        # Stream the response so we can log progress and capture thinking.
+        # This prevents the pipeline appearing hung during long think blocks.
+        raw_content, usage = _stream_completion(
+            raw_client, cfg["model_id"], messages, temp, top_p,
+            extra_body if extra_body else None, stage
         )
-
-        raw_content = raw_resp.choices[0].message.content or ""
-        usage       = raw_resp.usage
 
         # Extract thinking block and confidence signal
         thinking_block, answer, confidence = _extract_thinking(raw_content)
@@ -336,15 +454,23 @@ def call_model(
             result: T = response_schema.model_validate_json(answer)
             retries_used = 0
         except Exception:
-            # Instructor retry: ask model to reformat its answer as valid JSON schema
+            # Instructor retry: ask model to produce a populated INSTANCE not a schema.
+            # Critical: show field names only, not the full JSON Schema definition.
+            # Sending model_json_schema() causes the model to echo the schema back.
+            field_names = list(response_schema.model_fields.keys())
+            fields_hint = ", ".join(f'"{f}": <value>' for f in field_names[:6])
             result, completion = client.chat.completions.create_with_completion(
                 model    = cfg["model_id"],
                 messages = messages + [
                     {"role": "assistant", "content": answer},
                     {"role": "user",      "content": (
-                        f"Your response was not valid JSON matching the required schema. "
-                        f"Please reformat your answer as a JSON object matching: "
-                        f"{response_schema.model_json_schema()}"
+                        f"Your previous response could not be parsed. "
+                        f"Respond with a JSON object that is an INSTANCE (filled-in values), "
+                        f"NOT a schema definition. "
+                        f"Required fields: {field_names}. "
+                        f"Example structure: {{{fields_hint}}}. "
+                        f"Do not include $defs, properties, or type keys — "
+                        f"those are schema keywords, not values."
                     )},
                 ],
                 response_model = response_schema,
@@ -393,6 +519,8 @@ def call_role(
     response_schema: Type[T],
     stage:           str,
     run_dir:         str,
+    thinking:        False,
+    max_retries:     0,
     **kwargs,
 ) -> T:
     """

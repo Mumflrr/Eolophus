@@ -21,6 +21,13 @@ from pipeline.state import PipelineState
 from schemas.execution import DraftOutput, ComponentDraft
 from schemas.plan_spec import PlanSpec, ComponentSpec
 
+
+def _get_budget(stage: str) -> int:
+    """Read thinking token budget for this stage from routing.yaml."""
+    from clients.llm import _get_thinking_budget
+    return _get_thinking_budget(stage)
+
+
 log = logging.getLogger(__name__)
 
 # ── System prompts ────────────────────────────────────────────────────────────
@@ -31,102 +38,106 @@ You will receive a PlanSpec and implement it completely.
 PASS 1 — ARCHITECTURE (thinking mode):
 Think through the overall structure, component interfaces, shared data structures,
 and implementation order. Reason about edge cases and potential issues.
-When you are confident in the architecture, emit: <confidence>high</confidence>
+Reflect your confidence in the `confidence` field. If you are unsure or missing critical information, set confidence to 'low' and write a specific question to the user in `clarification_question`.
 
 PASS 2 — IMPLEMENTATION:
 Implement each component completely and correctly following the PlanSpec exactly.
 Every function signature must match the spec. Every edge case must be handled.
-Do not skip implementation or write placeholder code.
-"""
+Do not skip implementations or use placeholders."""
 
-_SYSTEM_SHORT = """You are implementing a software task from a structured plan.
-Implement all components completely and correctly.
-Follow the PlanSpec exactly — every function signature, every edge case.
-Do not write placeholder code or skip implementations."""
+_SYSTEM_SHORT = """You are a senior software developer executing a straightforward task.
+Implement the provided PlanSpec completely and directly.
+Do not over-engineer. Follow conventions. Handle all stated edge cases.
+Reflect your confidence in the `confidence` field. If you are unsure, set confidence to 'low' and write a question in `clarification_question`."""
 
 
-# ── Long mode: 35B draft ──────────────────────────────────────────────────────
+# ── Long mode node ────────────────────────────────────────────────────────────
 
 def draft_node(state: PipelineState) -> dict:
-    """Long mode draft — 35B MoE with architecture thinking pass."""
-    run_dir   = state["run_dir"]
-    plan      = state.get("plan_spec")
-    iteration = state.get("iteration", 0)
-
+    """
+    Generate DraftOutput from PlanSpec.
+    Applies correction feedback if this is a re-draft iteration.
+    """
+    run_dir = state["run_dir"]
+    plan    = state.get("plan_spec")
+    
     if not plan:
-        raise ValueError("draft_node: no plan_spec in state")
+        raise ValueError("draft_node: plan_spec missing from state")
 
-    plan_json = plan.model_dump_json(indent=2)
-
-    # Build correction context if re-drafting
-    correction_ctx = _build_correction_context(state)
-
-    user_content = f"Implement this PlanSpec completely:\n\n{plan_json}"
-    if correction_ctx:
-        user_content = f"{correction_ctx}\n\n{user_content}"
-
+    context = _build_correction_context(state)
+    
     messages = [
         {"role": "system", "content": _SYSTEM_LONG},
-        {"role": "user",   "content": user_content},
+        {"role": "user",   "content": f"PlanSpec:\n{plan.model_dump_json(indent=2)}\n{context}"},
     ]
 
-    # Architecture pass: thinking ON with NoWait + budget
     draft: DraftOutput = call_role(
-        role            = "draft_long",
+        role            = "draft",
         messages        = messages,
         response_schema = DraftOutput,
         stage           = "draft",
         run_dir         = run_dir,
         thinking        = True,
-        budget_tokens   = 8192,
+        budget_tokens   = _get_budget("draft"),
+        max_retries     = 0,
     )
 
-    return _finalise_draft(draft, run_dir, state)
+    if draft.confidence == "low" and draft.clarification_question:
+        log.warning("Drafter halted — needs human input: %s", draft.clarification_question)
+        return {
+            "pipeline_halted": True,
+            "clarification_needed": draft.clarification_question
+        }
+
+    return _finalize_draft(run_dir, draft, state)
 
 
-# ── Short mode: 9B draft ──────────────────────────────────────────────────────
+# ── Short mode node ───────────────────────────────────────────────────────────
 
 def draft_short_node(state: PipelineState) -> dict:
-    """Short mode draft — 9B (non-thinking rapid or thinking careful)."""
-    run_dir       = state["run_dir"]
-    plan          = state.get("plan_spec")
-    classification = state.get("classification")
-
+    """
+    9B execution for simple/moderate short-mode tasks.
+    Uses thinking if complexity=moderate, skips thinking if simple.
+    """
+    run_dir    = state["run_dir"]
+    plan       = state.get("plan_spec")
+    complexity = state.get("task_complexity", "simple")
+    
     if not plan:
-        raise ValueError("draft_short_node: no plan_spec in state")
+        raise ValueError("draft_short_node: plan_spec missing")
 
-    # Careful short mode uses thinking; rapid does not
-    use_thinking = False
-    role         = "draft_short"
-
-    plan_json = plan.model_dump_json(indent=2)
-    correction_ctx = _build_correction_context(state)
-
-    user_content = f"Implement this plan completely:\n\n{plan_json}"
-    if correction_ctx:
-        user_content = f"{correction_ctx}\n\n{user_content}"
-
+    use_thinking = (complexity == "moderate")
+    
+    context = _build_correction_context(state)
     messages = [
         {"role": "system", "content": _SYSTEM_SHORT},
-        {"role": "user",   "content": user_content},
+        {"role": "user",   "content": f"PlanSpec:\n{plan.model_dump_json(indent=2)}\n{context}"},
     ]
 
     draft: DraftOutput = call_role(
-        role            = role,
+        role            = "draft",
         messages        = messages,
         response_schema = DraftOutput,
-        stage           = "draft_short",
+        stage           = "draft",
         run_dir         = run_dir,
         thinking        = use_thinking,
         budget_tokens   = 2048 if use_thinking else 0,
+        max_retries     = 0,
     )
 
-    return _finalise_draft(draft, run_dir, state)
+    if draft.confidence == "low" and draft.clarification_question:
+        log.warning("Drafter (short) halted — needs human input: %s", draft.clarification_question)
+        return {
+            "pipeline_halted": True,
+            "clarification_needed": draft.clarification_question
+        }
+
+    return _finalize_draft(run_dir, draft, state)
 
 
-# ── Shared finalisation ───────────────────────────────────────────────────────
+# ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _finalise_draft(draft: DraftOutput, run_dir: str, state: PipelineState) -> dict:
+def _finalize_draft(run_dir: str, draft: DraftOutput, state: PipelineState) -> dict:
     """
     Run lazy evaluation guard.
     Write draft to disk (overwritten on re-draft).
@@ -172,7 +183,5 @@ def _build_correction_context(state: PipelineState) -> str:
         parts.append("Specific issues to fix:")
         for issue in verdict.specific_issues:
             parts.append(f"  - {issue}")
-    if verdict.suggested_fix_direction:
-        parts.append(f"Direction: {verdict.suggested_fix_direction}")
-
-    return "\n".join(parts)
+            
+    return "\n" + "\n".join(parts)

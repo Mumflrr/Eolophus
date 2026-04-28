@@ -1,6 +1,23 @@
 # routing.yaml — all routing rules, thresholds, and weights
 # No routing logic lives in code. Change behaviour by editing here.
 
+# ── Thinking budgets ─────────────────────────────────────────────────────────
+# Controls how many tokens each model spends thinking per stage.
+# Lower values = faster but shallower reasoning.
+# Set to 0 to disable thinking for that role entirely.
+# These override the per-model defaults in models.yaml.
+thinking_budgets:
+  plan:       2048   # 9B planning — consistency check + scaffold + PlanSpec
+  draft:      4096   # 35B architectural reasoning pass
+  appraise:   2048   # DeepCoder correctness appraisal
+  critic_b:   2048   # DeepCoder as Critic B
+  # Quick tuning reference:
+  #   512  = very fast, surface-level only
+  #   1024 = fast, adequate for simple tasks
+  #   2048 = balanced (recommended default)
+  #   4096 = thorough, use for complex tasks
+  #   8192 = maximum, only for very complex multi-component plans
+
 # ── Correction loop ──────────────────────────────────────────────────────────
 correction_loop:
   max_iterations:        4      # After this many iterations, return unresolvable

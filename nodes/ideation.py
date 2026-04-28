@@ -23,8 +23,9 @@ the problem space broadly and generate diverse approaches. Do NOT write code.
 Do NOT produce a final plan. Generate ideas — your output will be reviewed and
 filtered before any implementation decisions are made.
 
-Be creative. Include unconventional approaches. Flag tradeoffs honestly.
-Precision is less important than breadth at this stage."""
+Be creative. Include unconventional approaches that could still potentially work. Flag tradeoffs honestly.
+Precision is less important than breadth at this stage. Limit yourself to 
+a maximum of 5 approaches if applicable. Use short bullet points inside the JSON strings."""
 
 
 def ideation_node(state: PipelineState) -> dict:
