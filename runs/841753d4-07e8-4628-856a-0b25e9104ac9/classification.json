@@ -1,0 +1,10 @@
+{
+  "mode": "long",
+  "task_type": "mixed",
+  "complexity": "moderate",
+  "decompose": true,
+  "estimated_sub_specs": 4,
+  "reasoning": "Task involves both design (architecture planning) and implementation (coding). An event bus has multiple independent components: publishers, subscribers, message queue, and event dispatcher. Estimated at moderate complexity due to 'simple' qualifier but still requires multiple interconnected systems.",
+  "confidence": "high",
+  "clarification_question": null
+}

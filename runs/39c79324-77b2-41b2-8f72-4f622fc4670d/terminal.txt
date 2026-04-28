@@ -1,0 +1,336 @@
+23:25:27 [INFO] __main__: Prefix overrides: {'mode': 'long', 'task_type': 'mixed'}
+23:25:27 [INFO] storage.db: Database initialised at /home/dgart/.pipeline/pipeline.db
+23:25:27 [INFO] __main__: Run 39c79324-77b2-41b2-8f72-4f622fc4670d started
+23:25:27 [INFO] __main__: Run directory: /home/dgart/local-llama/Eolophus/runs/39c79324-77b2-41b2-8f72-4f622fc4670d
+23:25:27 [INFO] __main__: Task: design and implement a simple event bus system in Python
+23:25:28 [WARNING] pipeline.graph: langfuse not installed — tracing disabled. pip install langfuse to enable.
+23:25:28 [INFO] pipeline.graph: Pipeline graph compiled (14 nodes)
+23:25:28 [INFO] clients.model_manager: Loading model: 9b
+23:25:28 [INFO] clients.model_manager: Starting Qwen3.5-9B on port 8081...
+23:25:28 [INFO] clients.model_manager: Waiting for Qwen3.5-9B to load (timeout: 300s)...
+23:25:39 [INFO] clients.model_manager: Qwen3.5-9B loaded in 12s
+23:25:39 [INFO] clients.model_manager: Qwen3.5-9B ready on port 8081
+23:27:15 [INFO] clients.llm: [classify] Qwen3.5-9B → TaskClassification | 0+0 tok | 98952ms
+23:27:15 [INFO] nodes.classifier: Classification: mode=long type=mixed complexity=moderate decompose=False
+23:27:15 [INFO] clients.model_manager: Swapping model: 9b -> 27b
+23:27:15 [INFO] clients.model_manager: Stopping 9b (port 8081)...
+23:27:15 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+23:27:18 [INFO] clients.model_manager: Starting Qwen3.5-27B on port 8082...
+23:27:18 [INFO] clients.model_manager: Waiting for Qwen3.5-27B to load (timeout: 300s)...
+23:27:30 [INFO] clients.model_manager: Qwen3.5-27B loaded in 12s
+23:27:30 [INFO] clients.model_manager: Qwen3.5-27B ready on port 8082
+23:34:14 [INFO] clients.llm: [ideation] Qwen3.5-27B → IdeationOutput | 0+0 tok | 419064ms
+23:34:14 [INFO] nodes.ideation: Ideation: 5 approaches, 5 directions, 10 components
+Loading weights: 100%|██████████████████████████████████████████████████████████████| 391/391 [00:00<00:00, 1419.58it/s]
+23:34:22 [INFO] clients.llm: LLMLingua-2 compressor initialised
+Token indices sequence length is longer than the specified maximum sequence length for this model (1054 > 512). Running this sequence through the model will result in indexing errors
+23:34:25 [INFO] clients.model_manager: Swapping model: 27b -> 9b
+23:34:25 [INFO] clients.model_manager: Stopping 27b (port 8082)...
+23:34:26 [INFO] clients.model_manager: Starting Qwen3.5-9B on port 8081...
+23:34:26 [INFO] clients.model_manager: Waiting for Qwen3.5-9B to load (timeout: 300s)...
+23:34:35 [INFO] clients.model_manager: Qwen3.5-9B loaded in 9s
+23:34:35 [INFO] clients.model_manager: Qwen3.5-9B ready on port 8081
+23:36:38 [INFO] clients.llm: [plan] Qwen3.5-9B → PlanSpec | 0+0 tok | 126870ms
+23:36:38 [INFO] nodes.planner: Plan: 2 components, 5 edge cases, 5 dropped, confidence=high
+23:36:38 [INFO] clients.model_manager: Swapping model: 9b -> 35b
+23:36:38 [INFO] clients.model_manager: Stopping 9b (port 8081)...
+23:36:38 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+23:36:41 [INFO] clients.model_manager: Starting Qwen3.5-35B-MoE on port 8083...
+23:36:41 [INFO] clients.model_manager: Waiting for Qwen3.5-35B-MoE to load (timeout: 300s)...
+23:37:10 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (30s elapsed)
+23:37:39 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (60s elapsed)
+23:38:07 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (90s elapsed)
+23:38:36 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (120s elapsed)
+23:39:05 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (150s elapsed)
+23:39:35 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (180s elapsed)
+23:39:35 [INFO] clients.model_manager: Qwen3.5-35B-MoE loaded in 180s
+23:39:35 [INFO] clients.model_manager: Qwen3.5-35B-MoE ready on port 8083
+23:49:14 [INFO] openai._base_client: Retrying request to /chat/completions in 0.496874 seconds
+00:09:26 [INFO] openai._base_client: Retrying request to /chat/completions in 0.465621 seconds
+00:19:05 [INFO] openai._base_client: Retrying request to /chat/completions in 0.944197 seconds
+00:38:33 [INFO] openai._base_client: Retrying request to /chat/completions in 0.407941 seconds
+00:48:17 [INFO] openai._base_client: Retrying request to /chat/completions in 0.830825 seconds
+01:01:36 [INFO] clients.llm: [draft] Qwen3.5-35B-MoE → DraftOutput | 0+0 tok | 5086308ms
+01:01:36 [INFO] nodes.drafter: Draft: 2 components | guard=pass
+01:01:36 [INFO] clients.model_manager: Swapping model: 35b -> deepcoder
+01:01:36 [INFO] clients.model_manager: Stopping 35b (port 8083)...
+01:01:36 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+01:01:39 [INFO] clients.model_manager: Starting DeepCoder-14B on port 8084...
+01:01:39 [INFO] clients.model_manager: Waiting for DeepCoder-14B to load (timeout: 300s)...
+01:01:51 [INFO] clients.model_manager: DeepCoder-14B loaded in 12s
+01:01:51 [INFO] clients.model_manager: DeepCoder-14B ready on port 8084
+01:12:31 [INFO] clients.llm: [appraise] DeepCoder-14B → AppraisalReport | 0+0 tok | 658645ms
+01:12:31 [INFO] nodes.appraiser: Appraisal: high satisfaction | critical=0 major=0 minor=0 | iq2s=0
+01:12:31 [INFO] clients.model_manager: Swapping model: deepcoder -> coder14b
+01:12:31 [INFO] clients.model_manager: Stopping deepcoder (port 8084)...
+01:12:31 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+01:12:34 [INFO] clients.model_manager: Starting Qwen2.5-Coder-14B-Instruct on port 8085...
+01:12:34 [INFO] clients.model_manager: Waiting for Qwen2.5-Coder-14B-Instruct to load (timeout: 300s)...
+01:12:46 [INFO] clients.model_manager: Qwen2.5-Coder-14B-Instruct loaded in 12s
+01:12:46 [INFO] clients.model_manager: Qwen2.5-Coder-14B-Instruct ready on port 8085
+01:18:54 [INFO] clients.llm: [bugfix] Qwen2.5-Coder-14B-Instruct → FixedOutput | 0+0 tok | 374525ms
+01:18:54 [INFO] nodes.bugfixer: BugFix: 2 applied, 2 self-identified, 0 unfixed | quality=The implementation is robust, thread-safe, and meets all specified requirements. The code is well-structured and follows Pythonic conventions.
+01:18:54 [INFO] clients.model_manager: Swapping model: coder14b -> 9b
+01:18:54 [INFO] clients.model_manager: Stopping coder14b (port 8085)...
+01:18:57 [INFO] clients.model_manager: Starting Qwen3.5-9B on port 8081...
+01:18:57 [INFO] clients.model_manager: Waiting for Qwen3.5-9B to load (timeout: 300s)...
+01:19:09 [INFO] clients.model_manager: Qwen3.5-9B loaded in 12s
+01:19:09 [INFO] clients.model_manager: Qwen3.5-9B ready on port 8081
+01:19:47 [INFO] clients.llm: [validate] Qwen3.5-9B → ValidationVerdict | 0+0 tok | 38886ms
+01:19:47 [INFO] nodes.validator: Validation: minor_fix | iter=0 | issues=1
+01:19:47 [INFO] pipeline.routers: Router: verdict=minor_fix iter=1/4 mode=long
+01:19:47 [INFO] clients.model_manager: Swapping model: 9b -> 35b
+01:19:47 [INFO] clients.model_manager: Stopping 9b (port 8081)...
+01:19:47 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+01:19:50 [INFO] clients.model_manager: Starting Qwen3.5-35B-MoE on port 8083...
+01:19:50 [INFO] clients.model_manager: Waiting for Qwen3.5-35B-MoE to load (timeout: 300s)...
+01:20:19 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (30s elapsed)
+01:20:48 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (60s elapsed)
+01:21:18 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (90s elapsed)
+01:21:47 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (120s elapsed)
+01:22:17 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (150s elapsed)
+01:22:46 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (180s elapsed)
+01:22:49 [INFO] clients.model_manager: Qwen3.5-35B-MoE loaded in 183s
+01:22:49 [INFO] clients.model_manager: Qwen3.5-35B-MoE ready on port 8083
+01:32:34 [INFO] openai._base_client: Retrying request to /chat/completions in 0.472670 seconds
+01:52:58 [INFO] openai._base_client: Retrying request to /chat/completions in 0.436831 seconds
+02:02:40 [INFO] openai._base_client: Retrying request to /chat/completions in 0.993366 seconds
+02:15:29 [INFO] clients.llm: [draft] Qwen3.5-35B-MoE → DraftOutput | 0+0 tok | 3255693ms
+02:15:29 [INFO] nodes.drafter: Draft: 2 components | guard=pass
+02:15:29 [INFO] clients.model_manager: Swapping model: 35b -> deepcoder
+02:15:29 [INFO] clients.model_manager: Stopping 35b (port 8083)...
+02:15:29 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+02:15:32 [INFO] clients.model_manager: Starting DeepCoder-14B on port 8084...
+02:15:32 [INFO] clients.model_manager: Waiting for DeepCoder-14B to load (timeout: 300s)...
+02:15:44 [INFO] clients.model_manager: DeepCoder-14B loaded in 12s
+02:15:44 [INFO] clients.model_manager: DeepCoder-14B ready on port 8084
+02:19:22 [INFO] clients.llm: [appraise] DeepCoder-14B → AppraisalReport | 0+0 tok | 224384ms
+02:19:22 [INFO] nodes.appraiser: Appraisal: high satisfaction | critical=0 major=0 minor=0 | iq2s=0
+02:19:22 [INFO] clients.model_manager: Swapping model: deepcoder -> coder14b
+02:19:22 [INFO] clients.model_manager: Stopping deepcoder (port 8084)...
+02:19:22 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+02:19:25 [INFO] clients.model_manager: Starting Qwen2.5-Coder-14B-Instruct on port 8085...
+02:19:25 [INFO] clients.model_manager: Waiting for Qwen2.5-Coder-14B-Instruct to load (timeout: 300s)...
+02:19:35 [INFO] clients.model_manager: Qwen2.5-Coder-14B-Instruct loaded in 12s
+02:19:35 [INFO] clients.model_manager: Qwen2.5-Coder-14B-Instruct ready on port 8085
+02:27:19 [INFO] clients.llm: [bugfix] Qwen2.5-Coder-14B-Instruct → FixedOutput | 0+0 tok | 479739ms
+02:27:19 [INFO] nodes.bugfixer: BugFix: 6 applied, 5 self-identified, 0 unfixed | quality=The code is now thread-safe, handles exceptions appropriately, and manages subscriptions and publications as required. All edge cases are addressed, and the implementation aligns with the chosen approach and assumptions.
+02:27:19 [INFO] clients.model_manager: Swapping model: coder14b -> 9b
+02:27:19 [INFO] clients.model_manager: Stopping coder14b (port 8085)...
+02:27:19 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+02:27:22 [INFO] clients.model_manager: Starting Qwen3.5-9B on port 8081...
+02:27:22 [INFO] clients.model_manager: Waiting for Qwen3.5-9B to load (timeout: 300s)...
+02:27:34 [INFO] clients.model_manager: Qwen3.5-9B loaded in 12s
+02:27:34 [INFO] clients.model_manager: Qwen3.5-9B ready on port 8081
+02:28:27 [INFO] clients.llm: [validate] Qwen3.5-9B → ValidationVerdict | 0+0 tok | 55269ms
+02:28:27 [INFO] nodes.validator: Validation: minor_fix | iter=1 | issues=2
+02:28:27 [INFO] pipeline.routers: Router: verdict=minor_fix iter=2/4 mode=long
+02:28:27 [INFO] clients.model_manager: Swapping model: 9b -> 35b
+02:28:27 [INFO] clients.model_manager: Stopping 9b (port 8081)...
+02:28:27 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+02:28:30 [INFO] clients.model_manager: Starting Qwen3.5-35B-MoE on port 8083...
+02:28:30 [INFO] clients.model_manager: Waiting for Qwen3.5-35B-MoE to load (timeout: 300s)...
+02:28:59 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (30s elapsed)
+02:29:28 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (60s elapsed)
+02:29:57 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (90s elapsed)
+02:30:26 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (120s elapsed)
+02:30:55 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (150s elapsed)
+02:31:25 [INFO] clients.model_manager: Still waiting for Qwen3.5-35B-MoE... (180s elapsed)
+02:31:33 [INFO] clients.model_manager: Qwen3.5-35B-MoE loaded in 189s
+02:31:33 [INFO] clients.model_manager: Qwen3.5-35B-MoE ready on port 8083
+02:41:13 [INFO] openai._base_client: Retrying request to /chat/completions in 0.426342 seconds
+03:02:28 [INFO] openai._base_client: Retrying request to /chat/completions in 0.398821 seconds
+03:12:07 [INFO] openai._base_client: Retrying request to /chat/completions in 0.998375 seconds
+03:31:27 [INFO] openai._base_client: Retrying request to /chat/completions in 0.399273 seconds
+03:38:52 [INFO] clients.llm: [draft] Qwen3.5-35B-MoE → DraftOutput | 0+0 tok | 4185262ms
+03:38:52 [INFO] nodes.drafter: Draft: 2 components | guard=pass
+03:38:53 [INFO] clients.model_manager: Swapping model: 35b -> deepcoder
+03:38:53 [INFO] clients.model_manager: Stopping 35b (port 8083)...
+03:38:53 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+03:38:56 [INFO] clients.model_manager: Starting DeepCoder-14B on port 8084...
+03:38:56 [INFO] clients.model_manager: Waiting for DeepCoder-14B to load (timeout: 300s)...
+03:39:08 [INFO] clients.model_manager: DeepCoder-14B loaded in 12s
+03:39:08 [INFO] clients.model_manager: DeepCoder-14B ready on port 8084
+03:44:26 [INFO] clients.llm: [appraise] DeepCoder-14B → AppraisalReport | 0+0 tok | 329179ms
+03:44:26 [INFO] nodes.appraiser: Appraisal: high satisfaction | critical=0 major=0 minor=0 | iq2s=0
+03:44:26 [INFO] clients.model_manager: Swapping model: deepcoder -> coder14b
+03:44:26 [INFO] clients.model_manager: Stopping deepcoder (port 8084)...
+03:44:26 [WARNING] clients.model_manager: _kill_port: skipping own PID 1852433
+03:44:29 [INFO] clients.model_manager: Starting Qwen2.5-Coder-14B-Instruct on port 8085...
+03:44:29 [INFO] clients.model_manager: Waiting for Qwen2.5-Coder-14B-Instruct to load (timeout: 300s)...
+03:44:40 [INFO] clients.model_manager: Qwen2.5-Coder-14B-Instruct loaded in 12s
+03:44:40 [INFO] clients.model_manager: Qwen2.5-Coder-14B-Instruct ready on port 8085
+03:53:42 [INFO] clients.llm: [bugfix] Qwen2.5-Coder-14B-Instruct → FixedOutput | 0+0 tok | 561071ms
+03:53:42 [INFO] nodes.bugfixer: BugFix: 1 applied, 2 self-identified, 1 unfixed | quality=The implementation addresses the PlanSpec requirements and edge cases. However, there are unresolved issues with the __post_init__ method in the Event class and additional utility methods in the SimpleEventBus class that need to be addressed.
+03:53:42 [INFO] clients.model_manager: Swapping model: coder14b -> 9b
+03:53:42 [INFO] clients.model_manager: Stopping coder14b (port 8085)...
+03:53:45 [INFO] clients.model_manager: Starting Qwen3.5-9B on port 8081...
+03:53:45 [INFO] clients.model_manager: Waiting for Qwen3.5-9B to load (timeout: 300s)...
+03:53:54 [INFO] clients.model_manager: Qwen3.5-9B loaded in 9s
+03:53:54 [INFO] clients.model_manager: Qwen3.5-9B ready on port 8081
+03:55:26 [INFO] clients.llm: [validate] Qwen3.5-9B → ValidationVerdict | 0+0 tok | 95341ms
+03:55:26 [INFO] nodes.validator: Validation: pass | iter=2 | issues=0
+03:55:26 [INFO] pipeline.routers: Router: verdict=pass iter=3/4 mode=long
+03:55:26 [INFO] __main__: Pipeline completed successfully
+# Event
+"""
+Event Container
+
+Container for event data including type, payload, and unique identifier.
+Implements auto-ID generation via __post_init__ as per PlanSpec fix.
+"""
+
+from __future__ import annotations
+from dataclasses import dataclass
+from typing import Any, Optional
+from uuid import uuid4
+
+
+@dataclass
+class Event:
+    """
+    Container for event data including type, payload, and unique identifier.
+
+    Attributes:
+        event_type: The type/name of the event
+        payload: Arbitrary data to carry with the event
+        id: Unique identifier (auto-generated if not provided)
+    """
+    event_type: str
+    payload: Any
+    id: Optional[str] = None
+
+    def __post_init__(self) -> None:
+        """
+        Automatically generate a unique ID if not provided during initialization.
+
+        This ensures every Event instance has a valid UUID without requiring
+        manual intervention after construction. Fixes the issue where
+        auto_generate_id() had to be called manually.
+        """
+        if self.id is None:
+            self.id = str(uuid4())
+
+    def __str__(self) -> str:
+        """Human-readable string representation of the event."""
+        return f"Event(id={self.id}, type={self.event_type})"
+
+    def __repr__(self) -> str:
+        """Developer-friendly representation of the event."""
+        return f"Event(event_type='{self.event_type}', payload={self.payload!r}, id='{self.id}')"
+
+# SimpleEventBus
+"""
+SimpleEventBus Core Orchestrator
+
+Thread-safe, in-memory, synchronous event bus implementation
+following the publish-subscribe pattern.
+"""
+
+from __future__ import annotations
+from typing import Any, Callable
+import threading
+
+
+class SimpleEventBus:
+    """
+    Core orchestrator for event subscription, publishing, and listener lifecycle.
+
+    This implementation provides:
+    - Thread-safe operations via explicit locking
+    - Exception isolation (listener errors don't affect others)
+    - In-memory storage (no persistence)
+    - Synchronous call execution
+
+    Attributes:
+        _listeners: Dictionary mapping event types to lists of callback functions
+        _lock: Threading lock for thread-safe access to listeners
+    """
+
+    def __init__(self) -> None:
+        """Initialize the event bus with internal state."""
+        self._listeners: dict[str, list[Callable[..., Any]]] = {}
+        self._lock: threading.Lock = threading.Lock()
+
+    def subscribe(self, event_type: str, callback: Callable[..., Any]) -> None:
+        """
+        Register a listener callback for a specific event type.
+
+        Args:
+            event_type: The event type to listen for
+            callback: Function to call when event is published
+
+        Thread Safety:
+            Protected by internal lock to prevent race conditions
+            during concurrent subscription operations.
+        """
+        with self._lock:
+            if event_type not in self._listeners:
+                self._listeners[event_type] = []
+            self._listeners[event_type].append(callback)
+
+    def unsubscribe(self, event_type: str, callback: Callable[..., Any]) -> None:
+        """
+        Remove a specific listener from an event type.
+
+        Args:
+            event_type: The event type to unsubscribe from
+            callback: The callback function to remove
+
+        Notes:
+            - If the callback was never added, this is handled gracefully
+            - If the event_type has no listeners, this is handled gracefully
+        """
+        with self._lock:
+            if event_type in self._listeners:
+                try:
+                    self._listeners[event_type].remove(callback)
+                    # Clean up empty lists to prevent memory leaks
+                    if not self._listeners[event_type]:
+                        del self._listeners[event_type]
+                except ValueError:
+                    # Callback not in list, handle gracefully
+                    pass
+
+    def publish(self, event: Event) -> None:
+        """
+        Publish an event to all registered listeners.
+
+        Args:
+            event: The event to publish
+
+        Thread Safety:
+            - Lock is acquired to get a snapshot of listeners
+            - Each listener is called independently
+            - Exceptions in one listener don't affect others
+
+        Notes:
+            - Catches exceptions per listener to prevent cascade failures
+            - Publishing to event type with no listeners is a no-op
+        """
+        # Get a snapshot of listeners while holding the lock
+        with self._lock:
+            listeners = self._listeners.get(event.event_type, []).copy()
+
+        # Call each listener independently to prevent cascade failures
+        for callback in listeners:
+            try:
+                callback(event)
+            except Exception:
+                # Log or handle the exception - listener errors should not block others
+                # In production, you might want to log this for debugging
+                pass
+
+    def clear(self) -> None:
+        """
+        Remove all listeners from the bus.
+
+        Useful for testing and resetting state.
+        Thread-safe operation.
+        """
+        with self._lock:
+            self._listeners.clear()
+
+
+
+Run ID: 39c79324-77b2-41b2-8f72-4f622fc4670d

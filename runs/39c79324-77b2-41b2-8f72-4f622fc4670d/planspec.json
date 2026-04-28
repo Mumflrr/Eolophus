@@ -1,0 +1,213 @@
+{
+  "task_summary": "Design and implement a simple event bus system in Python that provides decoupled communication between components through a publish-subscribe pattern. The system will be thread-safe, in-memory, and synchronous, suitable for lightweight applications that need event-driven architecture without the complexity of distributed systems.",
+  "chosen_approach": "Memory Push-Based Bus with explicit subscription and error isolation. This approach provides simplicity, low latency, and reliability for a single-process Python application while avoiding the complexity of persistence, async handling, or hierarchical routing.",
+  "components": [
+    {
+      "name": "Event",
+      "responsibility": "Container for event data including type, payload, and unique identifier",
+      "functions": [
+        {
+          "name": "__init__",
+          "description": "Initialize event with type, payload, and id",
+          "parameters": [
+            {
+              "name": "event_type",
+              "type_hint": "str",
+              "description": "The type/name of the event",
+              "required": true,
+              "default": null
+            },
+            {
+              "name": "payload",
+              "type_hint": "Any",
+              "description": "Arbitrary data to carry with the event",
+              "required": true,
+              "default": null
+            },
+            {
+              "name": "id",
+              "type_hint": "Optional[str]",
+              "description": "Optional unique identifier",
+              "required": false,
+              "default": "None"
+            }
+          ],
+          "returns": "None",
+          "raises": [],
+          "notes": "Uses uuid4 for auto-generation if id not provided"
+        }
+      ],
+      "dependencies": [],
+      "data_structures": [
+        "dataclass"
+      ],
+      "interface_inputs": [
+        "event_type",
+        "payload"
+      ],
+      "interface_outputs": [
+        "Event instance"
+      ]
+    },
+    {
+      "name": "SimpleEventBus",
+      "responsibility": "Core orchestrator that manages event subscription, publishing, and listener lifecycle",
+      "functions": [
+        {
+          "name": "__init__",
+          "description": "Initialize the event bus with internal state",
+          "parameters": [
+            {
+              "name": "None",
+              "type_hint": "None",
+              "description": "No parameters",
+              "required": true,
+              "default": null
+            }
+          ],
+          "returns": "None",
+          "raises": [],
+          "notes": null
+        },
+        {
+          "name": "subscribe",
+          "description": "Register a listener callback for a specific event type",
+          "parameters": [
+            {
+              "name": "event_type",
+              "type_hint": "str",
+              "description": "The event type to listen for",
+              "required": true,
+              "default": null
+            },
+            {
+              "name": "callback",
+              "type_hint": "Callable[..., Any]",
+              "description": "Function to call when event is published",
+              "required": true,
+              "default": null
+            }
+          ],
+          "returns": "None",
+          "raises": [],
+          "notes": "Thread-safe with lock protection"
+        },
+        {
+          "name": "unsubscribe",
+          "description": "Remove a specific listener from an event type",
+          "parameters": [
+            {
+              "name": "event_type",
+              "type_hint": "str",
+              "description": "The event type to unsubscribe from",
+              "required": true,
+              "default": null
+            },
+            {
+              "name": "callback",
+              "type_hint": "Callable[..., Any]",
+              "description": "The callback function to remove",
+              "required": true,
+              "default": null
+            }
+          ],
+          "returns": "None",
+          "raises": [],
+          "notes": null
+        },
+        {
+          "name": "publish",
+          "description": "Publish an event to all registered listeners",
+          "parameters": [
+            {
+              "name": "event",
+              "type_hint": "Event",
+              "description": "The event to publish",
+              "required": true,
+              "default": null
+            }
+          ],
+          "returns": "None",
+          "raises": [],
+          "notes": "Catches exceptions per listener to prevent cascade failures"
+        },
+        {
+          "name": "clear",
+          "description": "Remove all listeners from the bus",
+          "parameters": [
+            {
+              "name": "None",
+              "type_hint": "None",
+              "description": "No parameters",
+              "required": true,
+              "default": null
+            }
+          ],
+          "returns": "None",
+          "raises": [],
+          "notes": "Useful for testing and resetting state"
+        }
+      ],
+      "dependencies": [],
+      "data_structures": [
+        "dict[str, list[Callable]]",
+        "threading.Lock"
+      ],
+      "interface_inputs": [
+        "Event instances",
+        "Callable functions for subscription"
+      ],
+      "interface_outputs": [
+        "None (side-effect only)"
+      ]
+    }
+  ],
+  "implementation_order": [
+    "Event",
+    "SimpleEventBus"
+  ],
+  "shared_data_structures": [
+    "dict[str, list[Callable]] - Maps event types to listener callbacks",
+    "threading.Lock - Ensures thread-safe access to listener lists"
+  ],
+  "edge_cases": [
+    "Listener raises an exception - must be caught to prevent blocking other listeners",
+    "Unsubscribing a callback that was never added - should be handled gracefully",
+    "Duplicate subscriptions to same event type - should be allowed (multiple listeners)",
+    "Publishing to event type with no listeners - should be a no-op",
+    "Thread safety when subscribe/publish/unsubscribe called concurrently"
+  ],
+  "assumptions": [
+    "The event bus is used within a single Python process",
+    "All listeners are synchronous callables (no async/await)",
+    "Thread safety is required via explicit locking",
+    "No persistence requirements (in-memory only)",
+    "Event types are strings and used as dictionary keys",
+    "Python 3.10+ with standard library only (no external dependencies)"
+  ],
+  "external_dependencies": [],
+  "moe_routing_context": "Python 3.10+ standard library, Observer pattern, thread-safe design with threading.Lock, dataclasses for type safety, callable protocol for listener functions, basic error handling with try-except blocks",
+  "dropped_ideas": [
+    {
+      "idea": "Persistent Pull-Based event bus with database storage",
+      "reason": "contradiction"
+    },
+    {
+      "idea": "Hierarchical Bus with distributed event federation",
+      "reason": "out-of-scope"
+    },
+    {
+      "idea": "Async-First Bus with Acknowledgments",
+      "reason": "violates simplicity constraint"
+    },
+    {
+      "idea": "Decorated Event-based registration",
+      "reason": "tradeoffs"
+    },
+    {
+      "idea": "Complex serialization and history buffer",
+      "reason": "out-of-scope"
+    }
+  ],
+  "confidence_in_plan": "high"
+}

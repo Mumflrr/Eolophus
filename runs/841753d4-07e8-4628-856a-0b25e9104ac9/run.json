@@ -1,0 +1,15 @@
+{
+  "run_uuid": "841753d4-07e8-4628-856a-0b25e9104ac9",
+  "mode": "long",
+  "task_type": "mixed",
+  "no_ensemble": false,
+  "image": null,
+  "started_at": "2026-04-20T14:41:08",
+  "status": "error",
+  "task_preview": "design and implement a simple event bus system in Python",
+  "prefix_overrides": {
+    "mode": "long",
+    "task_type": "mixed"
+  },
+  "completed_at": "2026-04-20T14:42:15"
+}
