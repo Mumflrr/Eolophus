@@ -71,7 +71,7 @@ models:
     port:        8084
     base_url:    "http://localhost:8084/v1"
     model_id:    "deepcoder-14b-q4_k_m"
-    context_len: 32768
+    context_len: 16384
     thinking:
       default_on: true
       budget_tokens: 4096
@@ -106,7 +106,7 @@ roles:
   draft_long:        "35b"
   draft_short:       "9b"        # short mode executor
   appraise:          "deepcoder"
-  bugfix:            "coder14b"
+  bugfix:            "deepcoder"
   critic_a:          "9b"
   critic_b:          "deepcoder"
   synthesis_complex: "35b"

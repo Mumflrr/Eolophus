@@ -91,6 +91,7 @@ def bugfix_node(state: PipelineState) -> dict:
         stage           = "bugfix",
         run_dir         = run_dir,
         thinking        = False,
+        max_retries     = 0,
     )
 
     # Guard: verify output was actually produced

@@ -22,6 +22,13 @@ from schemas.plan_spec import PlanSpec
 from schemas.lesson import LessonQuery
 from storage.lesson_store import retrieve_lessons, format_lessons_for_prompt
 
+
+def _get_budget(stage: str) -> int:
+    """Read thinking token budget for this stage from routing.yaml."""
+    from clients.llm import _get_thinking_budget
+    return _get_thinking_budget(stage)
+
+
 log = logging.getLogger(__name__)
 
 _SYSTEM = """You are the planning model for a software development pipeline.
@@ -34,79 +41,49 @@ a separate model. Your job is to:
    far-fetched ideas that cannot be translated into concrete steps, and
    out-of-scope suggestions. Flag and drop these in dropped_ideas.
 
-2. DOMAIN SCAFFOLD — Identify the technology domains, patterns, languages,
-   and frameworks relevant to this task. This becomes the moe_routing_context
-   that primes expert routing in the 35B MoE executor.
+2. DOMAIN SCAFFOLD — Identify the technology stack, test framework, and
+   execution context.
 
-3. PLAN — Translate viable ideas into a concrete, ordered PlanSpec.
-   Be precise: function signatures, data structures, implementation order,
-   edge cases, and assumptions. Only viable ideas survive to this stage.
+3. PLAN SPEC — Generate a precise, step-by-step implementation plan.
+   Break the solution down into distinct, testable components.
+   Every component must have a clear responsibility.
 
-When you are confident in your plan, emit: <confidence>high</confidence>
-in your reasoning before your final answer.
-"""
+Reflect your confidence in the `confidence` field. If you are unsure or missing critical information, set confidence to 'low' and write a specific question to the user in `clarification_question`."""
 
 
 def plan_node(state: PipelineState) -> dict:
     """
-    Produce a PlanSpec from the task input and optional IdeationOutput.
-    Uses thinking mode for consistency checking and planning precision.
+    Generate PlanSpec from normalized input + optional ideation.
+    Retrieves relevant lessons if any are found.
     """
     run_dir       = state["run_dir"]
     task          = state.get("normalised_input") or state.get("raw_text_input", "")
-    ideation      = state.get("ideation_output")
-    iteration     = state.get("iteration", 0)
     task_type     = state.get("task_type", "coding")
-    classification = state.get("classification")
+    ideation_text = ""
 
-    # Retrieve relevant lessons (Phase 2 only — returns [] in Phase 1)
-    tags = _derive_tags(task, task_type)
-    lessons = retrieve_lessons(LessonQuery(
-        task_type = task_type,
-        tags      = tags,
-    ))
-    lessons_block = format_lessons_for_prompt(lessons)
-
-    # Build user message
-    user_parts = []
-
-    if lessons_block:
-        user_parts.append(lessons_block)
-        user_parts.append("")
-
-    user_parts.append(f"Task:\n{task}")
-
+    # Compress ideation to save context window space
+    ideation = state.get("ideation_output")
     if ideation:
-        # Compress IdeationOutput prose before injecting (not code)
-        ideation_text = ideation.model_dump_json(indent=2)
-        ideation_compressed = compress_text(
-            ideation_text, ratio=0.5, min_tokens=200
-        )
-        user_parts.append(f"\nIdeationOutput (from 27B — apply consistency check):\n{ideation_compressed}")
+        raw_ideation = ideation.model_dump_json(indent=2)
+        ideation_text = compress_text(raw_ideation, ratio=0.5, min_tokens=200)
 
-    # Include correction feedback if this is a re-plan
-    if iteration > 0:
-        verdict = state.get("validation_verdict")
-        if verdict:
-            feedback_parts = []
-            if verdict.description:
-                feedback_parts.append(f"Previous plan issue: {verdict.description}")
-            if verdict.specific_issues:
-                issues_str = "\n".join(f"  - {i}" for i in verdict.specific_issues)
-                feedback_parts.append(f"Specific issues to address:\n{issues_str}")
-            if feedback_parts:
-                feedback_text = "\n".join(feedback_parts)
-                # Compress correction history on later iterations
-                if iteration > 1:
-                    feedback_text = compress_text(feedback_text, ratio=0.6, min_tokens=100)
-                user_parts.append(f"\n[CORRECTION FEEDBACK — iteration {iteration}]\n{feedback_text}")
+    # ── Lesson Retrieval ──
+    tags = _derive_tags(task, task_type)
+    lessons = retrieve_lessons(
+        query = LessonQuery(task_description=task, tags=tags),
+        limit = 3
+    )
+    lessons_context = format_lessons_for_prompt(lessons)
 
-    user_message = "\n".join(user_parts)
-
-    messages = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user",   "content": user_message},
-    ]
+    messages = [{"role": "system", "content": _SYSTEM}]
+    
+    user_prompt = f"Task:\n{task}\n"
+    if ideation_text:
+        user_prompt += f"\nIdeation Output (Compressed):\n{ideation_text}\n"
+    if lessons_context:
+        user_prompt += f"\nLessons Learned from past runs:\n{lessons_context}\n"
+        
+    messages.append({"role": "user", "content": user_prompt})
 
     plan: PlanSpec = call_role(
         role            = "plan",
@@ -115,18 +92,25 @@ def plan_node(state: PipelineState) -> dict:
         stage           = "plan",
         run_dir         = run_dir,
         thinking        = True,
-        budget_tokens   = 4096,
+        budget_tokens   = _get_budget("plan"),
+        max_retries     = 0,
     )
+
+    if plan.confidence == "low" and plan.clarification_question:
+        log.warning("Planner halted — needs human input: %s", plan.clarification_question)
+        return {
+            "pipeline_halted": True,
+            "clarification_needed": plan.clarification_question
+        }
 
     log.info(
-        "Plan: %d components, %d edge cases, %d dropped, confidence=%s",
-        len(plan.components),
-        len(plan.edge_cases),
+        "Plan: %d components | dropped ideas=%d | routing ctx=%s",
+        len(plan.implementation_order),
         len(plan.dropped_ideas),
-        plan.confidence_in_plan,
+        plan.moe_routing_context or "none",
     )
 
-    # Write PlanSpec to disk — persists entire run
+    # Write to disk
     plan_path = str(Path(run_dir) / "planspec.json")
     Path(plan_path).write_text(
         plan.model_dump_json(indent=2), encoding="utf-8"
@@ -168,8 +152,8 @@ def _derive_tags(task: str, task_type: str) -> list[str]:
         "error_handling": ["error", "exception", "try", "except"],
     }
 
-    for tag, keywords in tag_keywords.items():
-        if any(kw in text for kw in keywords):
+    for tag, kws in tag_keywords.items():
+        if any(kw in text for kw in kws):
             tags.append(tag)
 
     return list(set(tags))

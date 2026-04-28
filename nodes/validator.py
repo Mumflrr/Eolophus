@@ -122,6 +122,7 @@ def synthesise_node(state: PipelineState) -> dict:
         stage           = "synthesise",
         run_dir         = run_dir,
         thinking        = False,
+        max_retries     = 0,  
     )
 
     elapsed = (time.perf_counter() - start) * 1000
@@ -210,6 +211,7 @@ def validate_node(state: PipelineState) -> dict:
         stage           = "validate",
         run_dir         = run_dir,
         thinking        = False,
+        max_retries     = 0,
     )
 
     # Increment iteration counter for next loop
@@ -318,6 +320,7 @@ def final_validate_node(state: PipelineState) -> dict:
         stage           = "final_validate",
         run_dir         = run_dir,
         thinking        = False,
+        max_retries     = 0,
     )
 
     log.info(

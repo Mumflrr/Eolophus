@@ -7,3 +7,4 @@ from nodes.appraiser    import appraise_node
 from nodes.bugfixer     import bugfix_node
 from nodes.critics      import critic_a_node, critic_b_node
 from nodes.validator    import synthesise_node, validate_node, final_validate_node
+from nodes.describe     import describe_node

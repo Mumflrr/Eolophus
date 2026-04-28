@@ -9,6 +9,8 @@ from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field
 
+from schemas.confidence import ConfidenceMixin
+
 
 # ── DraftOutput ───────────────────────────────────────────────────────────────
 
@@ -21,7 +23,7 @@ class ComponentDraft(BaseModel):
     )
 
 
-class DraftOutput(BaseModel):
+class DraftOutput(ConfidenceMixin, BaseModel):
     """
     Complete draft produced by the 35B MoE.
     Passed to DeepCoder for correctness appraisal alongside the original PlanSpec.
@@ -40,10 +42,7 @@ class DraftOutput(BaseModel):
             "and why. Empty if fully spec-compliant."
         )
     )
-    confidence_signal: Optional[str] = Field(
-        default=None,
-        description="Populated from <confidence> tag in thinking output if present"
-    )
+    # The confidence_signal field was removed; ConfidenceMixin now handles this cleanly.
 
 
 # ── AppraisalReport ───────────────────────────────────────────────────────────
@@ -81,7 +80,7 @@ class Issue(BaseModel):
     )
 
 
-class AppraisalReport(BaseModel):
+class AppraisalReport(ConfidenceMixin, BaseModel):
     """
     Correctness appraisal produced by DeepCoder 14B.
     Received by Coder 14B alongside the DraftOutput.
