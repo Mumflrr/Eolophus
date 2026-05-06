@@ -9,8 +9,6 @@ from __future__ import annotations
 
 import logging
 import re
-from typing import Optional
-
 from pipeline.state import PipelineState
 from schemas.execution import DraftOutput, FixedOutput
 
@@ -145,3 +143,26 @@ def check_interface_compatibility(
                 )
 
     return len(violations) == 0, violations
+
+# ── Syntax validation guard ─────────────────────────────────────────
+
+import ast
+import traceback
+
+def check_ast_syntax(code: str) -> tuple[bool, str]:
+    """
+    Deterministic check to ensure the generated Python code is syntactically valid.
+    Uses Python's native AST parser.
+    
+    Returns (is_valid, error_traceback).
+    """
+    if not code.strip():
+        return False, "Code is empty."
+        
+    try:
+        ast.parse(code)
+        return True, "ok"
+    except SyntaxError as e:
+        # Capture the exact line and error for the LLM to fix
+        error_msg = "".join(traceback.format_exception_only(type(e), e)).strip()
+        return False, f"SyntaxError detected:\n{error_msg}"

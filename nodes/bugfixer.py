@@ -45,6 +45,19 @@ If an appraisal issue cannot be fixed at this stage, note it in unfixed_issues.
 """
 
 
+def apply_diff(original_code: str, edits: list) -> str:
+    """
+    Physically applies the SearchReplaceBlock edits to the draft code.
+    """
+    modified = original_code
+    for edit in edits:
+        if edit.search_text in modified:
+            # Replace only the first occurrence to avoid collateral damage
+            modified = modified.replace(edit.search_text, edit.replace_text, 1)
+        else:
+            log.warning("Diff Engine Error: Could not find exact search_text in code.")
+    return modified
+
 def bugfix_node(state: PipelineState) -> dict:
     """
     Apply bug fixes and idiomatic corrections to the draft.
@@ -91,7 +104,17 @@ def bugfix_node(state: PipelineState) -> dict:
         stage           = "bugfix",
         run_dir         = run_dir,
         thinking        = False,
+        max_retries     = 0,
     )
+
+    draft = state["draft_output"]
+    for fix in fixed.applied_fixes:
+        for comp in draft.component_drafts:
+            if comp.component_name == fix.component:
+                comp.code = apply_diff(comp.code, fix.edits)
+    
+    # Save the updated draft back to the state
+    state["draft_output"] = draft
 
     # Guard: verify output was actually produced
     passed, reason = check_fixed_output_present(fixed)

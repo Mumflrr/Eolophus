@@ -9,6 +9,8 @@ from enum import Enum
 from typing import Optional
 from pydantic import BaseModel, Field
 
+from schemas.confidence import ConfidenceMixin
+
 
 # ── DraftOutput ───────────────────────────────────────────────────────────────
 
@@ -21,7 +23,7 @@ class ComponentDraft(BaseModel):
     )
 
 
-class DraftOutput(BaseModel):
+class DraftOutput(ConfidenceMixin, BaseModel):
     """
     Complete draft produced by the 35B MoE.
     Passed to DeepCoder for correctness appraisal alongside the original PlanSpec.
@@ -40,10 +42,7 @@ class DraftOutput(BaseModel):
             "and why. Empty if fully spec-compliant."
         )
     )
-    confidence_signal: Optional[str] = Field(
-        default=None,
-        description="Populated from <confidence> tag in thinking output if present"
-    )
+    # The confidence_signal field was removed; ConfidenceMixin now handles this cleanly.
 
 
 # ── AppraisalReport ───────────────────────────────────────────────────────────
@@ -81,7 +80,7 @@ class Issue(BaseModel):
     )
 
 
-class AppraisalReport(BaseModel):
+class AppraisalReport(ConfidenceMixin, BaseModel):
     """
     Correctness appraisal produced by DeepCoder 14B.
     Received by Coder 14B alongside the DraftOutput.
@@ -114,26 +113,33 @@ class AppraisalReport(BaseModel):
         )
     )
 
-
 # ── FixedOutput ───────────────────────────────────────────────────────────────
+
+class SearchReplaceBlock(BaseModel):
+    search_text: str = Field(
+        description="The EXACT lines of code to remove, matching the original file perfectly, including indentation."
+    )
+    replace_text: str = Field(
+        description="The new lines of code to insert in place of the search_text."
+    )
+
 
 class AppliedFix(BaseModel):
     issue_description: str = Field(description="Brief description of the issue that was fixed")
     component:         str = Field(description="Component where fix was applied")
-    fix_description:   str = Field(description="What was changed and how")
+    edits:             list[SearchReplaceBlock] = Field(
+        description="The exact text replacements to apply the fix. Do not rewrite the whole file."
+    )
 
 
 class FixedOutput(BaseModel):
     """
-    Bug-fixed and idiomatically reviewed output from Coder 14B.
-    This is what the critique ensemble and final validation receive.
+    Bug-fixed and idiomatically reviewed diffs from Coder 14B.
+    This no longer outputs full component drafts, only surgical edits.
     """
-    component_drafts: list[ComponentDraft] = Field(
-        description="Fixed implementation — same structure as DraftOutput.component_drafts"
-    )
     applied_fixes: list[AppliedFix] = Field(
         default_factory=list,
-        description="Record of all fixes applied, including both appraisal-directed and self-identified"
+        description="Record of all fixes applied, including the specific search/replace diff blocks"
     )
     self_identified_issues: list[str] = Field(
         default_factory=list,

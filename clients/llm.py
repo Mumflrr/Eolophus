@@ -35,6 +35,21 @@ log = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
+_QWEN_TOOL_SYSTEM_PROMPT = """
+Answer the following questions as best you can. You have access to the following tools:
+{tool_definitions}
+
+Use the following format:
+Question: the input question you must answer
+Thought: you should always think about what to do
+Action: the action to take, should be one of [{tool_names}]
+Action Input: the input to the action
+Observation: the result of the action
+... (this Thought/Action/Action Input/Observation can repeat N times)
+Thought: I now know the final answer
+Final Answer: the final answer to the original input question
+"""
+
 # ── Config loading ─────────────────────────────────────────────────────────────
 
 _config_cache: dict = {}
@@ -47,6 +62,37 @@ def _load_config() -> dict:
         data = yaml.safe_load(f)
     _config_cache.update(data)
     return _config_cache
+
+
+def _get_thinking_budget(stage: str, complexity: str = "moderate") -> int:
+    """
+    Get the thinking token budget for a stage from routing.yaml.
+    Uses complexity-aware nested config: thinking_budgets.<stage>.<complexity>.
+    Falls back to 2048 if not configured.
+    """
+    import yaml as _yaml
+    try:
+        rp = Path(__file__).parent.parent / "config" / "routing.yaml"
+        with open(rp) as f:
+            rcfg = _yaml.safe_load(f)
+        stage_cfg = rcfg.get("thinking_budgets", {}).get(stage, {})
+        if isinstance(stage_cfg, dict):
+            return stage_cfg.get(complexity, stage_cfg.get("moderate", 2048))
+        return int(stage_cfg) if stage_cfg else 2048
+    except Exception:
+        return 2048
+
+
+def _get_http_timeout() -> float:
+    """Read HTTP timeout from routing.yaml. Default 7200s (2 hours)."""
+    import yaml as _yaml
+    try:
+        rp = Path(__file__).parent.parent / "config" / "routing.yaml"
+        with open(rp) as f:
+            rcfg = _yaml.safe_load(f)
+        return float(rcfg.get("http", {}).get("timeout_seconds", 7200))
+    except Exception:
+        return 7200.0
 
 
 def get_model_config(model_id: str) -> dict:
@@ -206,8 +252,11 @@ def _log_stage_entry(
     latency_ms: float,
     status:     str,
     retries:    int = 0,
+    load_ms:    float = 0.0,     # NEW
+    ttft_ms:    float = 0.0,     # NEW
+    think_ratio:float = 0.0,     # NEW
 ) -> None:
-    """Append one line to {run_dir}/stages.log"""
+    """Append one line to {run_dir}/stages.log and push to Langfuse"""
     log_path = Path(run_dir) / "stages.log"
     entry = {
         "ts":         time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -217,11 +266,101 @@ def _log_stage_entry(
         "tokens_in":  tokens_in,
         "tokens_out": tokens_out,
         "latency_ms": round(latency_ms, 1),
+        "load_ms":    round(load_ms, 1),
+        "ttft_ms":    round(ttft_ms, 1),
+        "think_ratio":round(think_ratio, 2),
         "status":     status,
         "retries":    retries,
     }
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
+        
+    # Inject granular metrics natively into the active LangGraph/Langchain trace
+    try:
+        from langfuse.decorators import langfuse_context
+        langfuse_context.update_current_observation(
+            metrics={
+                "model_load_ms": round(load_ms, 1),
+                "ttft_ms": round(ttft_ms, 1),
+                "thinking_ratio": round(think_ratio, 2)
+            },
+            tags=[stage, model_name]
+        )
+    except ImportError:
+        pass # Langfuse SDK not installed or not in context
+
+
+# ── Streaming completion helper ───────────────────────────────────────────────
+
+def _stream_completion(
+    client,
+    model_id:   str,
+    messages:   list,
+    temp:       float,
+    top_p:      float,
+    extra_body,
+    stage:      str,
+):
+    chunks      = []
+    token_count = 0
+    in_think    = False
+    think_toks  = 0
+    usage       = None
+    last_log    = 0
+    
+    # NEW: Telemetry trackers
+    start_ts    = time.perf_counter()
+    ttft_ms     = 0.0
+
+    try:
+        stream = client.chat.completions.create(
+            model      = model_id,
+            messages   = messages,
+            temperature= temp,
+            top_p      = top_p,
+            extra_body = extra_body,
+            stream     = True,
+        )
+
+        for chunk in stream:
+            # Capture TTFT on the very first chunk
+            if ttft_ms == 0.0:
+                ttft_ms = (time.perf_counter() - start_ts) * 1000
+
+            delta = chunk.choices[0].delta if chunk.choices else None
+            if delta and delta.content:
+                text = delta.content
+                chunks.append(text)
+                token_count += 1
+
+                combined = "".join(chunks)
+                if "<think>" in combined and not in_think:
+                    in_think = True
+                if in_think and "</think>" not in combined:
+                    think_toks += 1
+
+                if token_count - last_log >= 100:
+                    if in_think and "</think>" not in combined:
+                        log.debug("[%s] thinking... %d tokens", stage, think_toks)
+                    else:
+                        log.debug("[%s] generating... %d tokens", stage, token_count)
+                    last_log = token_count
+
+            if hasattr(chunk, "usage") and chunk.usage:
+                usage = chunk.usage
+
+    except Exception as e:
+        log.warning("[%s] streaming failed (%s), falling back to non-streaming", stage, e)
+        resp = client.chat.completions.create(
+            model=model_id, messages=messages, temperature=temp, top_p=top_p, extra_body=extra_body
+        )
+        return resp.choices[0].message.content or "", resp.usage, 0.0, 0, 0
+
+    full_content = "".join(chunks)
+    log.debug("[%s] completed: %d total tokens", stage, token_count)
+    
+    # Return the new telemetry data alongside the content
+    return full_content, usage, ttft_ms, think_toks, token_count
 
 
 # ── Core call function ────────────────────────────────────────────────────────
@@ -237,6 +376,7 @@ def call_model(
     compress_system: bool            = False,
     compress_ratio:  float           = 0.5,
     max_retries:     int             = 3,
+    skip_nowait:     bool            = False,
 ) -> T:
     """
     Make a structured model call via Instructor.
@@ -267,12 +407,34 @@ def call_model(
     temp       = cfg.get("temperature", 0.6)
     top_p      = cfg.get("top_p", 0.95)
 
+    # Ensure the model server is running before making the call.
+    # On single-GPU setups this may stop the previous model first.
+    # ── 1. Measure Model Load Time (VRAM Flash-Swap tracking) ──
+    load_start = time.perf_counter()
+    try:
+        from clients.model_manager import ensure_model_loaded
+        ensure_model_loaded(model_id)
+    except Exception as e:
+        log.warning("model_manager.ensure_model_loaded failed: %s", e)
+    load_ms = (time.perf_counter() - load_start) * 1000
+
+    if "35b" in model_id.lower() and response_schema:
+        for msg in messages:
+            if msg.get("role") == "system":
+                if "Answer the following questions as best you can" not in msg.get("content", ""):
+                    msg["content"] = _QWEN_TOOL_SYSTEM_PROMPT + "\n\n" + msg["content"]
+                break
+
     # Resolve thinking settings
     thinking_default = cfg.get("thinking", {}).get("default_on", False)
     use_thinking     = thinking if thinking is not None else thinking_default
-    tok_budget       = budget_tokens if budget_tokens is not None else (
-        cfg.get("thinking", {}).get("budget_tokens", 2048)
-    )
+    
+    if budget_tokens is not None:
+        tok_budget = budget_tokens
+    else:
+        # Apply the stage-specific budget from routing.yaml. 
+        # This overrides models.yaml defaults!
+        tok_budget = _get_thinking_budget(stage)
 
     # Apply LLMLingua-2 compression to system message if requested
     if compress_system:
@@ -288,38 +450,37 @@ def call_model(
     prompt_hash = hashlib.sha256(prompt_str.encode()).hexdigest()[:12]
 
     # Build extra_body for thinking mode and logit bias
+    # Always send thinking parameter explicitly — omitting it lets the model
+    # decide, which causes Qwen3.5 to think by default on every request.
     extra_body: dict[str, Any] = {}
     if use_thinking:
+        extra_body["reasoning_budget"] = tok_budget
         extra_body["thinking"] = {
-            "type":         "enabled",
-            "budget_tokens": tok_budget,
+            "type":          "enabled",
+            "budget_tokens":  tok_budget,
         }
-    logit_bias = _build_logit_bias(cfg)
+    else:
+        extra_body["thinking"] = {"type": "disabled"}
+        
+    logit_bias = _build_logit_bias(cfg) if not skip_nowait else None
     if logit_bias:
         extra_body["logit_bias"] = logit_bias
 
-    # Instructor client
-    raw_client = OpenAI(base_url=base_url, api_key="local")
+    # Instructor client — long timeout to avoid retry noise during 35B generation
+    _http_timeout = _get_http_timeout()
+    raw_client = OpenAI(base_url=base_url, api_key="local", max_retries=0, timeout=1200.0)
     client     = instructor.from_openai(raw_client, mode=instructor.Mode.JSON)
 
     retries_used = 0
     start_ts     = time.perf_counter()
 
     try:
-        # We call the raw completion first to capture thinking output,
-        # then pass the answer portion to Instructor for schema parsing.
-        # For models without thinking, raw_content == answer.
-
-        raw_resp = raw_client.chat.completions.create(
-            model    = cfg["model_id"],
-            messages = messages,
-            temperature = temp,
-            top_p    = top_p,
-            extra_body = extra_body if extra_body else None,
+        # Stream the response so we can log progress and capture thinking.
+        # ── 2. Unpack the updated _stream_completion telemetry variables ──
+        raw_content, usage, ttft_ms, think_toks, gen_toks = _stream_completion(
+            raw_client, cfg["model_id"], messages, temp, top_p,
+            extra_body if extra_body else None, stage
         )
-
-        raw_content = raw_resp.choices[0].message.content or ""
-        usage       = raw_resp.usage
 
         # Extract thinking block and confidence signal
         thinking_block, answer, confidence = _extract_thinking(raw_content)
@@ -329,22 +490,25 @@ def call_model(
             _write_thinking_log(run_dir, stage, thinking_block)
 
         # Now parse the answer portion via Instructor for schema validation
-        # We do this by creating a synthetic completion and patching via Instructor
-        # Alternatively: re-call with the answer as assistant message and ask to format.
-        # Simplest: use instructor.from_openai with the answer text directly.
         try:
             result: T = response_schema.model_validate_json(answer)
             retries_used = 0
         except Exception:
-            # Instructor retry: ask model to reformat its answer as valid JSON schema
+            # Instructor retry: ask model to produce a populated INSTANCE not a schema.
+            field_names = list(response_schema.model_fields.keys())
+            fields_hint = ", ".join(f'"{f}": <value>' for f in field_names[:6])
             result, completion = client.chat.completions.create_with_completion(
                 model    = cfg["model_id"],
                 messages = messages + [
                     {"role": "assistant", "content": answer},
                     {"role": "user",      "content": (
-                        f"Your response was not valid JSON matching the required schema. "
-                        f"Please reformat your answer as a JSON object matching: "
-                        f"{response_schema.model_json_schema()}"
+                        f"Your previous response could not be parsed. "
+                        f"Respond with a JSON object that is an INSTANCE (filled-in values), "
+                        f"NOT a schema definition. "
+                        f"Required fields: {field_names}. "
+                        f"Example structure: {{{fields_hint}}}. "
+                        f"Do not include $defs, properties, or type keys — "
+                        f"those are schema keywords, not values."
                     )},
                 ],
                 response_model = response_schema,
@@ -357,29 +521,53 @@ def call_model(
         if confidence and hasattr(result, "confidence_signal"):
             object.__setattr__(result, "confidence_signal", confidence)
 
+        # ── 3. Calculate Ratio & Log it ──
         elapsed_ms = (time.perf_counter() - start_ts) * 1000
         tokens_in  = usage.prompt_tokens     if usage else 0
         tokens_out = usage.completion_tokens if usage else 0
+        
+        # Guard against zero-division
+        think_ratio = (think_toks / gen_toks) if gen_toks > 0 else 0.0
 
         _log_stage_entry(
-            run_dir, stage, model_name, prompt_hash,
-            tokens_in, tokens_out, elapsed_ms,
-            "ok", retries_used,
+            run_dir=run_dir, 
+            stage=stage, 
+            model_name=model_name, 
+            prompt_hash=prompt_hash,
+            tokens_in=tokens_in, 
+            tokens_out=tokens_out, 
+            latency_ms=elapsed_ms,
+            status="ok", 
+            retries=retries_used,
+            load_ms=load_ms,
+            ttft_ms=ttft_ms,
+            think_ratio=think_ratio
         )
 
         log.info(
-            "[%s] %s → %s | %d+%d tok | %.0fms",
+            "[%s] %s → %s | %d+%d tok | TTFT: %.0fms | Ratio: %.2f | %.0fms",
             stage, model_name, response_schema.__name__,
-            tokens_in, tokens_out, elapsed_ms,
+            tokens_in, tokens_out, ttft_ms, think_ratio, elapsed_ms,
         )
 
         return result
 
     except Exception as exc:
+        # Fallback logging if the stream or the retry fails outright
         elapsed_ms = (time.perf_counter() - start_ts) * 1000
         _log_stage_entry(
-            run_dir, stage, model_name, prompt_hash,
-            0, 0, elapsed_ms, f"error:{type(exc).__name__}", retries_used,
+            run_dir=run_dir, 
+            stage=stage, 
+            model_name=model_name, 
+            prompt_hash=prompt_hash,
+            tokens_in=0, 
+            tokens_out=0, 
+            latency_ms=elapsed_ms,
+            status=f"error:{type(exc).__name__}", 
+            retries=retries_used,
+            load_ms=load_ms,
+            ttft_ms=0.0,
+            think_ratio=0.0
         )
         log.error("[%s] %s call failed: %s", stage, model_name, exc)
         raise
@@ -393,6 +581,8 @@ def call_role(
     response_schema: Type[T],
     stage:           str,
     run_dir:         str,
+    thinking:        False,
+    max_retries:     0,
     **kwargs,
 ) -> T:
     """
