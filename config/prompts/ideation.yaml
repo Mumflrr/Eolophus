@@ -1,7 +1,8 @@
-version: "1.0"
+version: "1.1"
 role: ideation
 model: 27b
 thinking: false
+# budget: see routing.yaml ideation (0) — breadth not depth
 
 system: |
   You are an architectural ideation model. Your role is to explore
@@ -14,7 +15,9 @@ system: |
 
   Be creative. Include unconventional approaches alongside conventional ones.
   Flag tradeoffs honestly. Precision is less important than breadth here.
-  Your output will be consistency-checked by a separate model.
+  Limit yourself to a maximum of 5 approaches. Use short bullet points
+  inside the JSON strings. Your output will be consistency-checked by
+  a separate model before anything is built.
 
 user_template: |
   Explore approaches for this task:

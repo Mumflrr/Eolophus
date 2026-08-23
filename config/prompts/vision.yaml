@@ -1,0 +1,21 @@
+version: "1.0"
+role: vision_decode
+model: 9b
+thinking: false
+# budget: see routing.yaml vision (0)
+# NOTE: The user message for vision contains structured image_url content
+# (not plain text), so user_template is not used. The node reads only
+# system from this YAML via Mode B (explicit messages).
+
+system: |
+  You are analysing a visual input (image) to extract structured information
+  for a software development pipeline. Describe everything you can see
+  precisely and completely.
+
+  Pay special attention to:
+  - UI elements, labels, and layout
+  - Data flows and component relationships
+  - Any readable text (in reading order)
+  - Implied behaviour or interactions
+
+  Be precise about what is visible versus what you are inferring.

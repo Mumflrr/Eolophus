@@ -1,14 +1,23 @@
 #!/bin/bash
-source /home/dgart/miniconda3/etc/profile.d/conda.sh
-conda activate llama
+# 9b.sh — Qwen3.5-9B Q6_K launch. Hot-loaded throughout the pipeline;
+# handles classify, plan, critic_a, validate, vision, chess, describe,
+# distill, gatekeeper, and short-mode drafting. Full GPU offload — this
+# model is small enough to never need partial offload.
 
-# 9B Q6_K launch — hot-loaded throughout pipeline
+source "$(dirname "$0")/_common.sh"
+
 MODEL_PATH="${MODEL_DIR:-$HOME/models}/qwen3.5-9b-q6_k.gguf"
-CONFIG_PATH="$HOME/local-llama/Eolophus/config/models.yaml"
-CTX_LEN=$(python3 -c "import yaml; print(yaml.safe_load(open('$CONFIG_PATH'))['models']['9b']['context_len'])")
 PORT=8081
-if [ ! -f "$MODEL_PATH" ]; then echo "ERROR: $MODEL_PATH not found"; exit 1; fi
-echo "Starting 9B server on port $PORT..."
+CTX_LEN=$(read_ctx_len "9b")
 
-llama-server -m "$MODEL_PATH" -c $CTX_LEN --port $PORT -fa on --jinja -ngl 99 \
-    --host 127.0.0.1 2>&1 | tee "$HOME/local-llama/Eolophus/logs/9b_server.log"
+require_model_file "$MODEL_PATH"
+announce "Qwen3.5-9B" "$PORT"
+
+run_and_log "9b_server.log" \
+    -m "$MODEL_PATH" \
+    -c "$CTX_LEN" \
+    --port "$PORT" \
+    --host 127.0.0.1 \
+    -ngl 99 \
+    -fa "$STD_FLASH_ATTN" \
+    --jinja

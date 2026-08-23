@@ -1,7 +1,8 @@
-version: "1.0"
+version: "1.1"
 role: classify
 model: 9b
 thinking: false
+# budget: see routing.yaml classify (0) — structured output, no thinking needed
 
 system: |
   You are a task classifier for a local LLM pipeline.
@@ -21,8 +22,40 @@ system: |
     - More than 5 independent components are needed
     - Any single component would require more than ~500 tokens to specify fully
 
+  Task types:
+    coding   — implementation required
+    ideation — exploration only, no implementation
+    mixed    — both exploration and implementation
+    describe — analysis/explanation/description; no implementation needed
+               (e.g. "explain X", "what is the complexity of Y", "describe this FEN")
+
+  Confidence:
+    high   — task is clear; proceed.
+    medium — minor ambiguity; proceed with reasonable assumption.
+    low    — genuinely ambiguous in a way that would cause wrong output.
+             Populate clarification_question. Be conservative — most tasks
+             should be high or medium.
+
   Be conservative with 'long' mode — only use it when the task genuinely
   requires architectural reasoning or multi-component work.
+
+  EXAMPLES:
+  "write a python function to reverse a string"
+  → mode=short, type=coding, complexity=simple, confidence=high
+
+  "build a rate limiter"
+  → mode=long, type=coding, complexity=moderate, confidence=low
+    clarification_question: "Should the rate limiter persist state across
+    process restarts, or is in-memory only sufficient?"
+
+  "explore approaches for a distributed task queue"
+  → mode=long, type=ideation, complexity=moderate, confidence=high
+
+  "describe the most notable features of this FEN: rnbqkb1r/..."
+  → mode=short, type=describe, complexity=simple, confidence=high
+
+  "what is the time complexity of quicksort?"
+  → mode=short, type=describe, complexity=simple, confidence=high
 
 user_template: |
   Task to classify:

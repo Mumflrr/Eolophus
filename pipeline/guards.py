@@ -75,14 +75,14 @@ def check_lazy_evaluation(draft: DraftOutput) -> tuple[bool, str]:
 
 
 def check_fixed_output_present(fixed: FixedOutput) -> tuple[bool, str]:
-    """Verify Coder 14B produced actual fixed code, not empty output."""
-    if not fixed.component_drafts:
-        return False, "FixedOutput contains no component_drafts"
-
-    all_code = "\n".join(cd.code for cd in fixed.component_drafts)
-    if not all_code.strip():
-        return False, "FixedOutput component_drafts all have empty code"
-
+    """
+    Verify the bugfixer produced actual output.
+    FixedOutput no longer contains component_drafts — it uses applied_fixes.
+    A run with no fixes AND no self-identified issues means the bugfixer
+    produced nothing actionable.
+    """
+    if not fixed.applied_fixes and not fixed.self_identified_issues:
+        return False, "FixedOutput has no applied_fixes and no self_identified_issues"
     return True, "ok"
 
 

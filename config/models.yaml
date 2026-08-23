@@ -1,29 +1,26 @@
 # models.yaml — all model configuration
 # Change a model, port, or quant: edit here only. No code changes required.
 # Thinking mode and budget_tokens are per-call overrides; defaults set here.
+# NOTE: budget_tokens are centralized in routing.yaml — not set per-model.
 
 models:
 
   # ── Qwen3.5-9B Q6_K (bartowski) ─────────────────────────────────────────
-  # Roles: vision decode, scaffold+plan (thinking), critic_a, validate
-  # Hot-loaded throughout; never swapped out
   9b:
     name:        "Qwen3.5-9B"
     quant:       "Q6_K"
     source:      "bartowski"
     port:        8081
     base_url:    "http://localhost:8081/v1"
-    model_id:    "qwen3.5-9b-q6_k"          # as registered with llama.cpp server
+    model_id:    "qwen3.5-9b-q6_k"
     context_len: 32768
     thinking:
-      default_on: false                      # overridden per call
-      budget_tokens: 4096                    # max thinking tokens when ON
+      default_on: false
+      budget_tokens: 4096        # reference only — routing.yaml governs per-stage
     temperature: 0.6
     top_p:       0.95
 
   # ── Qwen3.6-35B MoE UD-Q4_K_M (unsloth) ───────────────────────────────
-  # Roles: draft generation (long mode), synthesis (complex tasks)
-  # Loaded on demand; heaviest model
   35b:
     name:        "Qwen3.6-35B-MoE"
     quant:       "UD-Q4_K_M"
@@ -34,34 +31,57 @@ models:
     context_len: 65536
     thinking:
       default_on: true
-      budget_tokens: 8192                    # architecture pass; component fill disables
+      budget_tokens: 8192
     temperature: 0.6
     top_p:       0.95
-    min_p:       0.0                         # CRITICAL for Unsloth 3.6 MoE routing
-    presence_penalty: 1.0                    # Prevents infinite loops in <think> tags
-    nowait_tokens:                           # logit bias token IDs for NoWait suppression
+    min_p:       0.0             # CRITICAL for Unsloth 3.6 MoE — intentionally disabled
+    presence_penalty: 1.0        # Prevents infinite loops in <think> tags
+    nowait_tokens:               # logit bias token IDs for NoWait suppression
       _note: "Run tools/derive_nowait_tokens.py to populate this section"
 
-  # ── Qwen3.5-27B IQ2_S (bartowski) ───────────────────────────────────────
-  # Roles: ideation (long mode only)
-  # Loaded on demand; unloaded after ideation stage
+  # ── Qwen3.8-27B-UD-IQ2_S (bartowski) ────────────────────────────────────
   27b:
-    name:        "Qwen3.5-27B"
-    quant:       "IQ2_XXS"
-    source:      "bartowski"
+    name:        "Qwen3.8-27B"
+    quant:       "IQ2_S"
+    source:      "unsloth"
     port:        8082
     base_url:    "http://localhost:8082/v1"
-    model_id:    "qwen3.5-27b-iq2_s"
+    model_id:    "qwen3.8-27b-UD-iq2_s"
     context_len: 16384
     thinking:
       default_on: false
       budget_tokens: 0
-    temperature: 0.8                         # slightly higher for ideation breadth
+    temperature: 0.8
     top_p:       0.95
 
-  # ── DeepCoder 14B Q4_K_M (bartowski) ────────────────────────────────────
-  # Roles: correctness appraisal, critic_b (ensemble)
-  # Loaded on demand
+  # ── Qwen3.6-27B MTP (ultra mode) ───────────────────────────────────────
+  # Manually triggered only — overnight deep-thinking runs.
+  # Requires a separate MTP-capable GGUF (grafted draft heads).
+  # Download: havenoammo/Qwen3.6-27B-MTP-UD-GGUF or froggeric/Qwen3.6-27B-MTP-GGUF
+  # Requires llama.cpp built from PR #22673 for MTP to activate.
+  # Partial VRAM offload: early layers on GPU, rest in pinned system RAM.
+  # See config/llama_flags/27b_ultra.sh for tuning knobs (NGL, MTP_DRAFT, THREADS).
+  27b_ultra:
+    name:        "Qwen3.6-27B-MTP-Ultra"
+    quant:       "Q4_K_M-MTP"
+    source:      "havenoammo/froggeric"
+    port:        8085
+    base_url:    "http://localhost:8085/v1"
+    model_id:    "qwen3.6-27b-mtp-q4_k_m"
+    context_len: 131072           # large context for overnight tasks
+    thinking:
+      default_on:   true
+      budget_tokens: -1           # -1 = unlimited (pipeline sets per-call)
+    temperature: 0.6
+    top_p:       0.95
+    mtp:
+      enabled:       true
+      draft_n_max:   3            # optimal: 92.6% acceptance, better than 5
+      spec_type:     "mtp"
+      requires_mtp_gguf: true     # reminder: standard GGUF silently ignores MTP flags
+    partial_offload:
+      ngl:     28                 # tune via ULTRA_NGL env var in 27b_ultra.sh
+      note:    "28 ≈ 8GB VRAM; reduce to 20 if OOM; increase to 32 if headroom"
   deepcoder:
     name:        "DeepCoder-14B"
     quant:       "Q4_K_M"
@@ -73,18 +93,20 @@ models:
     thinking:
       default_on: true
       budget_tokens: 4096
-    temperature: 0.4                         # lower for correctness checking
+    temperature: 0.4
     top_p:       0.9
+
 
 # ── Role → model mapping ─────────────────────────────────────────────────────
 # Change which model handles which role without touching code.
 roles:
+  # Pipeline roles
   vision_decode:     "9b"
   classify:          "9b"
   ideation:          "27b"
   plan:              "9b"
-  draft_long:        "35b"
-  draft_short:       "9b"        # short mode executor
+  draft:             "35b"
+  draft_short:       "9b"
   appraise:          "deepcoder"
   bugfix:            "deepcoder"
   critic_a:          "9b"
@@ -93,3 +115,19 @@ roles:
   synthesis_simple:  "9b"
   validate:          "9b"
   final_validate:    "9b"
+  describe:          "9b"
+  distill:           "9b"
+  gatekeeper:        "9b"
+
+  # Ultra mode roles — manually triggered only, map to 27b_ultra
+  # All pipeline stages get the same model; budget is set per-stage
+  # in routing.yaml thinking_budgets.ultra_* keys.
+  ultra_plan:            "27b_ultra"
+  ultra_draft:           "27b_ultra"
+  ultra_appraise:        "27b_ultra"
+  ultra_critic:          "27b_ultra"
+  # The 35B would require a VRAM swap from the always-hot 9B, adding 30-60s
+  # of dead time to a real-time chess UI. 9B at 512/1024 thinking tokens
+  # comfortably handles move classification and tactical pattern recognition.
+  chess_fast:        "9b"       # Every-move analysis, 512 thinking tokens
+  chess_slow:        "9b"       # Flagged moves (blunders/mirages), 1024 tokens

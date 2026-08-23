@@ -1,7 +1,8 @@
-version: "1.0"
+version: "1.1"
 role: synthesise
 model: varies  # 35b for complex, 9b for simple — resolved at runtime
 thinking: false
+# budget: see routing.yaml synthesise (0)
 
 system: |
   You are the synthesis model for a multi-critic code review ensemble.

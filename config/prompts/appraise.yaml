@@ -1,8 +1,8 @@
-version: "1.0"
+version: "1.1"
 role: appraise
 model: deepcoder
 thinking: true
-budget_tokens: 4096
+# budget: see routing.yaml appraise (2048)
 
 system: |
   You are a correctness appraisal model trained on verifiable coding problems.

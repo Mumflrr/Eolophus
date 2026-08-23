@@ -232,6 +232,9 @@ def apply_flag_overrides(args, overrides: dict) -> None:
     effective_mode = args.mode or overrides.get("mode")
     if effective_mode == "short":
         os.environ["PIPELINE_FORCE_SHORT"] = "1"
+    elif effective_mode == "ultra":
+        os.environ["PIPELINE_ULTRA"] = "1"
+        log.info("Ultra mode active — Qwen3.6-27B-MTP, unlimited thinking budget.")
 
 
 def _extract_output(state: dict) -> str:
@@ -297,9 +300,9 @@ def main() -> int:
     )
     parser.add_argument(
         "--mode",
-        choices = ["short", "long"],
+        choices = ["short", "long", "ultra"],
         default = None,
-        help    = "Force pipeline mode (default: auto-classified by 9B)",
+        help    = "Force pipeline mode. ultra = overnight deep-thinking (Qwen3.6-27B-MTP, unlimited budget). Requires MTP GGUF + PR #22673 build.",
     )
     parser.add_argument(
         "--task-type",
@@ -391,7 +394,7 @@ def main() -> int:
     initial_state = build_initial_state(run_uuid, run_dir, task, args, prefix_overrides)
 
     # ── 7. Run pipeline ───────────────────────────────────────────────────────
-    app = get_graph()
+    app, callbacks = get_graph()
 
     failed = False
     try:
@@ -401,6 +404,8 @@ def main() -> int:
             "configurable": {"thread_id": run_uuid}, 
             "run_name": run_uuid
         }
+        if callbacks:
+            config["callbacks"] = callbacks
         
         # Start the initial run
         final_state = app.invoke(initial_state, config=config)

@@ -1,0 +1,21 @@
+version: "1.0"
+role: draft_short
+model: 9b
+thinking: false
+# budget: see routing.yaml draft (4096) for moderate complexity,
+#         0 for simple (node logic sets thinking=False for simple tasks)
+
+system: |
+  You are a senior software developer executing a straightforward task.
+  Implement the provided PlanSpec completely and directly.
+
+  - Do not over-engineer
+  - Follow the language/framework conventions in moe_routing_context
+  - Handle all stated edge cases
+  - Every function signature must match the PlanSpec exactly
+  - No placeholder code or TODO comments
+
+user_template: |
+  {correction_block}Implement this PlanSpec completely:
+
+  {plan_json}

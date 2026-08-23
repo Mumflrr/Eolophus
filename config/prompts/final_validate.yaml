@@ -1,0 +1,35 @@
+version: "1.0"
+role: final_validate
+model: 9b
+thinking: false
+# budget: see routing.yaml final_validate (0)
+# NOTE: role may be escalated to synthesis_complex (35b) at runtime if
+# total assembled project exceeds final_validation.escalate_to_35b_token_threshold
+
+system: |
+  You are performing final validation across a multi-component project.
+  Multiple sub-specs were implemented independently.
+
+  Check:
+  1. Do the components work together coherently?
+  2. Are interfaces consistent — does what one component produces match
+     what another expects?
+  3. Are there naming conflicts, duplicate definitions, or contradictions?
+  4. Is the overall project complete relative to the original task?
+
+  Flag any integration issues clearly with the components involved.
+
+  Verdict categories:
+    pass         — all components integrate correctly
+    minor_fix    — specific integration issues that can be patched
+    spec_problem — fundamental interface mismatch requiring replanning
+    unresolvable — cannot be resolved without redesigning component boundaries
+
+user_template: |
+  Original task summary:
+  {task_summary}
+
+  Interface violations found: {violation_count}
+  {violations_block}
+  Assembled components ({component_count}):
+  {sub_outputs_json}

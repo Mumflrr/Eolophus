@@ -1,5 +1,5 @@
 """
-nodes/bugfixer.py — Qwen2.5 Coder 14B bug fix and idiomatic review.
+nodes/bugfixer.py — DeepCoder 14B bug fix and idiomatic review.
 
 Receives: DraftOutput + AppraisalReport (if available) + PlanSpec.
 Performs:
@@ -8,7 +8,8 @@ Performs:
   3. Idiomatic corrections and code quality polish
 Produces: FixedOutput — what the critique ensemble receives.
 
-Non-thinking mode — precise repair, not reasoning.
+Non-thinking mode — precise repair, not reasoning. Budget from routing.yaml.
+Prompt lives in config/prompts/bugfix.yaml.
 """
 
 from __future__ import annotations
@@ -23,40 +24,17 @@ from schemas.execution import FixedOutput
 
 log = logging.getLogger(__name__)
 
-_SYSTEM = """You are a code repair and review specialist with deep knowledge of
-real-world software patterns and library conventions.
-
-You will receive a draft implementation, an optional appraisal report identifying
-issues, and the original plan spec.
-
-Your job:
-1. Apply ALL fixes identified in the AppraisalReport (if present).
-2. Independently review the code for bugs your expertise identifies
-   that the appraisal may have missed — focus on: incorrect API usage,
-   non-idiomatic patterns, missing imports, subtle runtime errors,
-   incomplete error handling, type mismatches.
-3. Polish for real-world code quality: naming, structure, conventions.
-
-Do NOT rewrite working code without a reason.
-Do NOT change interfaces specified in the PlanSpec.
-Record every change you make in applied_fixes.
-Record any issues you found independently in self_identified_issues.
-If an appraisal issue cannot be fixed at this stage, note it in unfixed_issues.
-"""
-
 
 def apply_diff(original_code: str, edits: list) -> str:
-    """
-    Physically applies the SearchReplaceBlock edits to the draft code.
-    """
+    """Apply SearchReplaceBlock edits to draft code in-place."""
     modified = original_code
     for edit in edits:
         if edit.search_text in modified:
-            # Replace only the first occurrence to avoid collateral damage
             modified = modified.replace(edit.search_text, edit.replace_text, 1)
         else:
-            log.warning("Diff Engine Error: Could not find exact search_text in code.")
+            log.warning("Diff Engine: could not find exact search_text in code — skipping edit")
     return modified
+
 
 def bugfix_node(state: PipelineState) -> dict:
     """
@@ -72,34 +50,33 @@ def bugfix_node(state: PipelineState) -> dict:
     if not draft:
         raise ValueError("bugfix_node: missing draft_output")
 
-    # Build user message
-    parts = []
-
-    if plan:
-        parts.append(f"PlanSpec (interfaces must be preserved):\n{plan.model_dump_json(indent=2)}")
-
-    parts.append(f"\nDraft to fix:\n{draft.model_dump_json(indent=2)}")
-
+    # ── Build template vars ────────────────────────────────────────────────
+    appraisal_block = ""
     if appraisal:
-        parts.append(f"\nAppraisalReport (apply all identified fixes):\n{appraisal.model_dump_json(indent=2)}")
+        appraisal_block = (
+            f"AppraisalReport (apply all identified fixes):\n"
+            f"{appraisal.model_dump_json(indent=2)}"
+        )
     else:
-        parts.append("\n[No AppraisalReport available — apply your own review only]")
+        appraisal_block = "[No AppraisalReport available — apply your own review only]"
 
-    # Include validator feedback if this is a correction-loop re-fix
+    correction_block = ""
     if iteration > 0:
         verdict = state.get("validation_verdict")
         if verdict and verdict.specific_issues:
             issues_str = "\n".join(f"  - {i}" for i in verdict.specific_issues)
-            parts.append(f"\n[Validator feedback from previous iteration]:\n{issues_str}")
-
-    messages = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user",   "content": "\n\n".join(parts)},
-    ]
+            correction_block = (
+                f"\n[Validator feedback from iteration {iteration}]:\n{issues_str}"
+            )
 
     fixed: FixedOutput = call_role(
         role            = "bugfix",
-        messages        = messages,
+        template_vars   = {
+            "plan_json":       plan.model_dump_json(indent=2) if plan else "not available",
+            "draft_json":      draft.model_dump_json(indent=2),
+            "appraisal_block": appraisal_block,
+            "correction_block":correction_block,
+        },
         response_schema = FixedOutput,
         stage           = "bugfix",
         run_dir         = run_dir,
@@ -107,33 +84,28 @@ def bugfix_node(state: PipelineState) -> dict:
         max_retries     = 0,
     )
 
-    draft = state["draft_output"]
+    # Apply diffs back onto the draft
     for fix in fixed.applied_fixes:
         for comp in draft.component_drafts:
             if comp.component_name == fix.component:
                 comp.code = apply_diff(comp.code, fix.edits)
-    
-    # Save the updated draft back to the state
+
     state["draft_output"] = draft
 
-    # Guard: verify output was actually produced
     passed, reason = check_fixed_output_present(fixed)
     if not passed:
         log.warning("bugfix_node: output guard failed: %s", reason)
 
     log.info(
-        "BugFix: %d applied, %d self-identified, %d unfixed | quality=%s",
+        "BugFix: %d applied | %d self-identified | %d unfixed | quality=%s",
         len(fixed.applied_fixes),
         len(fixed.self_identified_issues),
         len(fixed.unfixed_issues),
         fixed.overall_quality,
     )
 
-    # Write to disk
     fixed_path = str(Path(run_dir) / "fixed.json")
-    Path(fixed_path).write_text(
-        fixed.model_dump_json(indent=2), encoding="utf-8"
-    )
+    Path(fixed_path).write_text(fixed.model_dump_json(indent=2), encoding="utf-8")
 
     return {
         "fixed_output": fixed,

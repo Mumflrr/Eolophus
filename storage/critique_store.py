@@ -81,6 +81,32 @@ def write_run(
         conn.close()
 
 
+def update_critique_resolved(run_uuid: str, iteration: int, resolved: bool) -> None:
+    """
+    Update the resolved flag on an existing critique_record row.
+    Called by validate_node after the final verdict is known — synthesise_node
+    writes the record first with a provisional resolved value, and validate
+    may override the synthesis verdict, so this corrects the SQLite record.
+    """
+    conn = get_conn()
+    try:
+        conn.execute(
+            """
+            UPDATE critique_records
+            SET resolved = ?
+            WHERE run_uuid = ? AND iteration = ?
+            """,
+            (int(resolved), run_uuid, iteration),
+        )
+        conn.commit()
+        log.debug(
+            "CritiqueRecord resolved=%s for run %s iter %d",
+            resolved, run_uuid, iteration,
+        )
+    finally:
+        conn.close()
+
+
 def update_run_status(
     run_uuid:               str,
     status:                 str,

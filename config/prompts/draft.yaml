@@ -1,8 +1,8 @@
-version: "1.0"
+version: "1.1"
 role: draft
 model: 35b
 thinking: true
-budget_tokens: 8192
+# budget: see routing.yaml draft (4096)
 
 system: |
   You are a senior software architect and implementer.

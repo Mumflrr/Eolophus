@@ -89,3 +89,20 @@ class PipelineState(TypedDict, total=False):
     pipeline_complete:  bool
     pipeline_failed:    bool
     failure_reason:     Optional[str]
+    pipeline_halted: bool
+    clarification_needed: Optional[str]
+
+    # ── Custom pipeline bookkeeping ──────────────────────────────────────
+    # CRITICAL: LangGraph only tracks top-level keys declared on this
+    # TypedDict — any key a node returns that ISN'T listed here is
+    # silently dropped (confirmed empirically, not a guess). Per-step
+    # dynamic data (one decision node's outcome, one freeform node's
+    # output) therefore CANNOT use a dynamically-named top-level key like
+    # f"_decision__{step_id}" — it must live INSIDE one of these fixed
+    # dict-valued fields instead, since dict contents aren't subject to
+    # this restriction, only the TypedDict's own key set is.
+    custom_step_outputs: dict       # step_id -> whatever that step produced
+    custom_decisions:    dict       # decision_step_id -> chosen outcome value
+    custom_iter_counts:  dict       # decision_step_id -> times visited
+    custom_feedback:     Optional[str]  # most recent decision's reasoning, or None
+    global_step_count:   int

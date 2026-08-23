@@ -1,50 +1,35 @@
 #!/bin/bash
-# 35B MoE launch config for RTX 3080/4060 (8-10 GB VRAM)
-# Target: ~8 GB VRAM via partial expert offload
-# Expected throughput: ~30-36 tok/s (The "VRAM Miracle" config)
-#
-# Flags:
-#   --n-cpu-moe 38     The magic number for 8GB cards: offloads just enough experts to CPU
-#   -ngl 99            Offload all standard non-expert layers to GPU
-#   -ctk q8_0          KV cache keys quantised to 8-bit (VRAM saving)
-#   -ctv q8_0          KV cache values quantised to 8-bit
-#   -fa 1              Flash Attention (reduces attention VRAM pressure)
-#   -b 2048 -ub 2048   Higher batch sizes for much faster prompt processing
-#   -c 65536           Context window (tune down to 32768 if VRAM pressure)
-#   -t                 Thread count for CPU expert computation
+# 35b.sh — Qwen3.6-35B MoE UD-Q4_K_M launch. Long-mode drafting and
+# complex synthesis. Partial expert offload — this is the one model in
+# the standard fleet that doesn't fit in 8-10GB VRAM whole, so unlike
+# the other three scripts, this one genuinely needs different flags:
+# tensor-level expert offload to CPU, quantized KV cache, and tuned
+# batch/thread sizes. Do not "simplify" this to match 9b/27b/deepcoder —
+# the difference here is real, not accidental duplication.
 
-source /home/dgart/miniconda3/etc/profile.d/conda.sh
-conda activate llama
+source "$(dirname "$0")/_common.sh"
 
 MODEL_PATH="${MODEL_DIR:-$HOME/models}/qwen3.6-35b-moe-ud-q4_k_m.gguf"
-CONFIG_PATH="$HOME/local-llama/Eolophus/config/models.yaml"
-CTX_LEN=$(python3 -c "import yaml; print(yaml.safe_load(open('$CONFIG_PATH'))['models']['35b']['context_len'])")
 PORT=8083
-THREADS=10  # Adjust: physical_cores / 1.5 rounded down
+CTX_LEN=$(read_ctx_len "35b")
+THREADS="${LLAMA_35B_THREADS:-10}"   # physical_cores / 1.5, rounded down
 
-if [ ! -f "$MODEL_PATH" ]; then
-    echo "ERROR: Model not found at $MODEL_PATH"
-    echo "Set MODEL_DIR or place model at $HOME/models/"
-    exit 1
-fi
+require_model_file "$MODEL_PATH"
+announce "Qwen3.6-35B-MoE" "$PORT"
+echo "  threads: $THREADS (override with LLAMA_35B_THREADS)"
 
-echo "Starting 35B MoE server on port $PORT..."
-echo "Model: $MODEL_PATH"
-echo "Threads: $THREADS"
-
-llama-server \
+run_and_log "35b_server.log" \
     -m "$MODEL_PATH" \
-    -c $CTX_LEN \
-    --port $PORT \
+    -c "$CTX_LEN" \
+    --port "$PORT" \
+    --host 127.0.0.1 \
     -ot ".ffn_.*_exps.=CPU" \
     -ngl 99 \
     -ctk turbo3 \
     -ctv turbo3 \
-    -fa 1 \
+    -fa "$STD_FLASH_ATTN" \
     -b 2048 \
     -ub 2048 \
-    -t $THREADS \
+    -t "$THREADS" \
     --mlock \
-    --jinja \
-    --host 127.0.0.1 \
-    2>&1 | tee "$HOME/local-llama/Eolophus/logs/35b_server.log"
+    --jinja

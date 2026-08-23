@@ -2,24 +2,58 @@
 # No routing logic lives in code. Change behaviour by editing here.
 
 # ── Thinking budgets ─────────────────────────────────────────────────────────
-# Controls how many tokens each model spends thinking per stage.
-# Lower values = faster but shallower reasoning.
-# Set to 0 to disable thinking for that role entirely.
-# These override the per-model defaults in models.yaml.
+# THE single source of truth for thinking token budgets.
+# YAML prompt files (config/prompts/*.yaml) intentionally do NOT set budget_tokens.
+# All nodes read budget from here via _get_thinking_budget(stage).
+#
+# Set to 0 to disable thinking for that stage entirely.
+# Reference:
+#   512  = very fast, surface-level only
+#   1024 = fast, adequate for simple tasks
+#   2048 = balanced (recommended default)
+#   4096 = thorough, use for complex tasks
+#   8192 = maximum, only for very complex multi-component plans
 
 thinking_budgets:
-  plan:        1024   # Tightened: 9B planning — consistency check + scaffold + PlanSpec
-  draft:       4096   # Pass 1: 35B architectural reasoning
-  draft_pass2: 0      # Pass 2: 35B code emission (NO THINKING)
-  appraise:    2048   # Pass 1: DeepCoder correctness appraisal
-  bugfix:      0      # Pass 2: DeepCoder diff generation (NO THINKING)
-  critic_b:    2048   # DeepCoder as Critic B
-  # Quick tuning reference:
-  #   512  = very fast, surface-level only
-  #   1024 = fast, adequate for simple tasks
-  #   2048 = balanced (recommended default)
-  #   4096 = thorough, use for complex tasks
-  #   8192 = maximum, only for very complex multi-component plans
+  # ── Planning stages ───────────────────────────────────────────────────────
+  plan:        1024   # 9B planning — consistency check + scaffold + PlanSpec
+  draft:       4096   # 35B architectural reasoning (pass 1)
+  draft_pass2: 0      # 35B code emission (pass 2 — NO THINKING)
+
+  # ── Appraisal and bugfix ──────────────────────────────────────────────────
+  appraise:    2048   # DeepCoder correctness appraisal
+  bugfix:      0      # DeepCoder diff generation — NO THINKING
+
+  # ── Critique ensemble ─────────────────────────────────────────────────────
+  critic_a:    0      # 9B coherence — non-thinking by design
+  critic_b:    2048   # DeepCoder correctness verification
+
+  # ── Validation ────────────────────────────────────────────────────────────
+  synthesise:  0      # Synthesis model — decisive, not deliberative
+  validate:    0      # Gate validation — decisive
+  final_validate: 0   # Cross-spec coherence — decisive
+
+  # ── Classification ────────────────────────────────────────────────────────
+  classify:    0      # Classifier — fast, structured output
+  audit:       0      # Gatekeeper audit — fast check
+
+  # ── Direct-answer and auxiliary stages ───────────────────────────────────
+  describe:    512    # Direct answer node — light thinking
+  ideation:    0      # 27B ideation — breadth not depth
+  vision:      0      # 9B vision decode — structured extraction
+  distill:     0      # 9B lesson distillation — simple judgment
+
+  # ── Ultra mode budgets (27b_ultra, manually triggered) ───────────────────
+  # -1 = no cap imposed by the pipeline — model thinks until done.
+  # The server's context_len (131072) is the only practical limit.
+  # These are overnight / deep-analysis budgets. Do not use interactively.
+  ultra_plan:      -1
+  ultra_draft:     -1
+  ultra_appraise:  -1
+  ultra_critic:    -1
+  chess_fast:  512    # Every-move analysis — fast
+  chess_slow:  1024   # Flagged moves (blunders, mirages, sacrifices) — deeper
+
 
 # ── Correction loop ──────────────────────────────────────────────────────────
 correction_loop:
@@ -49,46 +83,68 @@ decomposition:
 
 # ── Lesson retrieval (LessonL) ───────────────────────────────────────────────
 lesson_retrieval:
-  enabled:         true         # Phase 1: store-only (retrieval off until min_lessons met)
-  inject_enabled:  true         # Phase 2: set to true after sufficient lessons accumulated
-  min_lessons_for_inject: 50    # Don't inject until this many lessons exist in store
-  top_k:           5            # Maximum lessons to inject per planning prompt
-  min_score:       0.2          # Minimum composite score to include a lesson
-  # Scoring weights — must sum to 1.0
+  enabled:         true
+  inject_enabled:  true
+  min_lessons_for_inject: 50
+  top_k:           5
+  min_score:       0.2
   weights:
     confidence:  0.4
     recency:     0.3
     similarity:  0.2
     difficulty:  0.1
-  # Recency decay: score = 1 / (1 + days_since_last_triggered * decay_rate)
   recency_decay_rate: 0.05
-  # Deduplication: lessons with similarity above this threshold merge rather than duplicate
   dedup_threshold: 0.85
-  # Meta-distillation: consolidate after this many runs
   meta_distill_every_n_runs: 50
 
 # ── LLMLingua-2 compression ──────────────────────────────────────────────────
 compression:
   enabled:              true
-  # Compression targets and ratios (never compress code)
-  ideation_ratio:       0.5     # Compress IdeationOutput to 50% of tokens
-  correction_history_ratio: 0.4 # Compress accumulated verdict/feedback history
-  min_tokens_to_compress: 200   # Don't compress if content is below this token count
-  # Quality guard: if compression confidence drops below this, skip compression
+  ideation_ratio:       0.5
+  correction_history_ratio: 0.4
+  min_tokens_to_compress: 200
   min_confidence:       0.7
 
 # ── Short mode executor ──────────────────────────────────────────────────────
 short_mode:
-  rapid_executor:       "9b_nonthinking"   # fastest path: 9B non-thinking
-  careful_executor:     "9b_thinking"      # slower but more accurate
+  rapid_executor:       "9b_nonthinking"
+  careful_executor:     "9b_thinking"
 
 # ── Synthesis model selection ────────────────────────────────────────────────
 synthesis:
-  complex_threshold:    "complex"   # Use 35B for synthesis when complexity >= this
-  # If 35B is not loaded and synthesis needed, fall back to 9B
+  complex_threshold:    "complex"
   fallback_to_9b_if_35b_unloaded: true
 
 # ── Final validation ─────────────────────────────────────────────────────────
 final_validation:
-  # Escalate to 35B for final validation if assembled project exceeds this token estimate
   escalate_to_35b_token_threshold: 12000
+
+# ── HTTP settings ─────────────────────────────────────────────────────────────
+http:
+  timeout_seconds: 7200
+
+# ── Ultra mode ────────────────────────────────────────────────────────────────
+# Manually triggered overnight deep-thinking mode.
+# Uses Qwen3.6-27B-MTP with partial VRAM offload and near-unlimited think budget.
+#
+# Trigger via run.py: pass --mode ultra or set PIPELINE_ULTRA=1
+# The pipeline will:
+#   1. Stop the currently hot model (9B) via model_manager
+#   2. Load 27b_ultra (partial offload — most layers in system RAM)
+#   3. Route all stages through ultra_* roles
+#   4. Set thinking budget to -1 (unlimited) for all stages
+#   5. On completion, stop 27b_ultra and reload 9B
+#
+# Do NOT trigger during interactive use — VRAM swap + RAM-resident layers
+# means generation is ~10-20 tok/s. This is an overnight mode.
+ultra_mode:
+  enabled:              false   # set to true OR pass --mode ultra at runtime
+  force_long_mode:      true    # always run 35B-equivalent pipeline depth
+  force_ensemble:       true    # always run full critic ensemble
+  max_iterations:       8       # double the normal correction loop limit
+  model:                "27b_ultra"
+  thinking_budget:      -1      # unlimited — practical limit is context_len
+  note: >
+    Requires MTP-capable GGUF and llama.cpp built from PR #22673.
+    See config/llama_flags/27b_ultra.sh for hardware tuning.
+    Expected throughput: 14-25 tok/s with MTP on 8-10GB VRAM card.

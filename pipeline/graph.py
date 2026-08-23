@@ -176,8 +176,11 @@ def _run_sub_spec(
     }
 
     try:
-        app = get_graph()
-        final_state = app.invoke(initial_state)
+        app, callbacks = get_graph()
+        config = {"configurable": {"thread_id": sub_uuid}}
+        if callbacks:
+            config["callbacks"] = callbacks
+        final_state = app.invoke(initial_state, config=config)
         return not final_state.get("pipeline_failed", True)
     except Exception as e:
         log.error("Sub-spec %s failed: %s", sub_uuid[:8], e)
@@ -352,12 +355,11 @@ def get_graph():
 
     # ── Compile with Langfuse callback and MemorySaver ───────────────────────
     callbacks = _build_callbacks()
-    
     memory = MemorySaver()
     app = builder.compile(checkpointer=memory)
 
     log.info("Pipeline graph compiled (%d nodes)", len(builder.nodes))
-    return app
+    return app, callbacks
 
 
 def _build_callbacks() -> list:

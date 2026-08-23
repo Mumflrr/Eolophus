@@ -1,0 +1,84 @@
+/* ══════════════════════════════════════════════════════════════════════
+   Design tokens — derived from Dacelo (design_reference.md)
+   Pure black base, diagonal blue/purple gradient wash, frosted-glass
+   cards, semantic accent colors, monospaced data.
+   ══════════════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── Base ── */
+  --black: #000000;
+  --bg-gradient-blue: rgba(59, 130, 246, 0.18);
+  --bg-gradient-purple: rgba(168, 85, 247, 0.22);
+  --bg-gradient-blue-ultra: rgba(99, 102, 241, 0.24);
+  --bg-gradient-purple-ultra: rgba(147, 51, 234, 0.30);
+
+  /* ── Semantic accents ── */
+  --c-blue: #4d9fff;
+  --c-blue-dim: rgba(77, 159, 255, 0.15);
+  --c-blue-border: rgba(77, 159, 255, 0.4);
+
+  --c-purple: #b57bff;
+  --c-purple-dim: rgba(181, 123, 255, 0.15);
+  --c-purple-border: rgba(181, 123, 255, 0.4);
+
+  --c-green: #4ade80;
+  --c-green-dim: rgba(74, 222, 128, 0.15);
+  --c-green-border: rgba(74, 222, 128, 0.4);
+
+  --c-red: #f87171;
+  --c-red-dim: rgba(248, 113, 113, 0.15);
+  --c-red-border: rgba(248, 113, 113, 0.4);
+
+  --c-orange: #fb923c;
+  --c-orange-dim: rgba(251, 146, 60, 0.15);
+  --c-orange-border: rgba(251, 146, 60, 0.4);
+
+  --c-grey: #9ca3af;
+  --c-grey-dim: rgba(156, 163, 175, 0.15);
+  --c-grey-border: rgba(156, 163, 175, 0.4);
+
+  /* ── Text ── */
+  --text-primary: rgba(255, 255, 255, 0.96);
+  --text-secondary: rgba(255, 255, 255, 0.55);
+  --text-tertiary: rgba(255, 255, 255, 0.38);
+  --text-disabled: rgba(255, 255, 255, 0.22);
+
+  /* ── Surfaces ── */
+  --glass-fill: rgba(255, 255, 255, 0.05);
+  --glass-fill-raised: rgba(255, 255, 255, 0.08);
+  --glass-border: rgba(255, 255, 255, 0.1);
+  --glass-blur: 20px;
+  --divider: rgba(255, 255, 255, 0.1);
+
+  --shadow-card: 0 12px 28px -4px rgba(0, 0, 0, 0.45), 0 2px 6px rgba(0, 0, 0, 0.35);
+
+  /* ── Radii ── */
+  --r-card: 16px;
+  --r-badge: 8px;
+  --r-control: 10px;
+  --r-pill: 999px;
+
+  /* ── Type ── */
+  --font-display: "Space Grotesk", "IBM Plex Sans", system-ui, sans-serif;
+  --font-body: "IBM Plex Sans", system-ui, -apple-system, sans-serif;
+  --font-mono: "IBM Plex Mono", "SF Mono", ui-monospace, Menlo, monospace;
+
+  /* ── Motion ── */
+  --ease: cubic-bezier(0.4, 0, 0.2, 1);
+  --dur-fast: 0.15s;
+  --dur-med: 0.3s;
+  --dur-mode: 0.8s;
+
+  /* ── Layout ── */
+  --sidebar-w: 232px;
+  --header-h: 56px;
+  --content-max: 1160px;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur-fast: 0.001s;
+    --dur-med: 0.001s;
+    --dur-mode: 0.001s;
+  }
+}

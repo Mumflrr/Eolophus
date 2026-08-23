@@ -6,6 +6,7 @@ Normalises image input into structured text before planning.
 from __future__ import annotations
 from typing import Optional
 from pydantic import BaseModel, Field
+from schemas.confidence import ConfidenceMixin
 
 
 class UIElement(BaseModel):
@@ -14,11 +15,15 @@ class UIElement(BaseModel):
     description:  str  = Field(description="What this element does or represents")
 
 
-class VisualDescription(BaseModel):
+class VisualDescription(ConfidenceMixin, BaseModel):
     """
     Structured text description of a visual input.
     Produced by 9B vision decode; consumed by planning stage.
     Downstream models have no awareness of the original input modality.
+
+    Inherits from ConfidenceMixin:
+      confidence              — low if image is blurry/ambiguous; halts pipeline
+      clarification_question  — what the user should clarify
     """
     summary: str = Field(
         description="One or two sentence summary of what the image shows."

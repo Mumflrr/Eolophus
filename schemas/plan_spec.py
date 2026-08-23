@@ -7,6 +7,7 @@ that survived the consistency check. The 35B MoE receives this as its primary in
 from __future__ import annotations
 from typing import Optional
 from pydantic import BaseModel, Field
+from schemas.confidence import ConfidenceMixin
 
 
 class Parameter(BaseModel):
@@ -41,11 +42,15 @@ class DroppedIdea(BaseModel):
     reason: str = Field(description="Why it was dropped: contradiction / infeasible / far-fetched / out-of-scope")
 
 
-class PlanSpec(BaseModel):
+class PlanSpec(ConfidenceMixin, BaseModel):
     """
     Ordered implementation plan produced by the 9B after consistency filtering.
     This is the contract the 35B MoE executes against.
     All downstream models receive this alongside their primary input.
+
+    Inherits from ConfidenceMixin:
+      confidence              — high/medium/low; low halts the pipeline
+      clarification_question  — populated when confidence=low
     """
     task_summary: str = Field(
         description="One paragraph summary of what is being built and why."
@@ -91,7 +96,4 @@ class PlanSpec(BaseModel):
     dropped_ideas: list[DroppedIdea] = Field(
         default_factory=list,
         description="Ideas from ideation that were filtered out and why. Preserved for lineage tracking."
-    )
-    confidence_in_plan: str = Field(
-        description="high / medium / low — with brief explanation if medium or low."
     )

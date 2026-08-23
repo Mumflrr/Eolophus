@@ -1,16 +1,19 @@
 """
 clients/llm.py — single wrapper for all model calls.
 
-Every node calls call_model() — nothing else directly instantiates
+Every node calls call_role() — nothing else directly instantiates
 an Instructor client or OpenAI client.
 
 Responsibilities:
   - Load model config from models.yaml
+  - Load prompt templates from config/prompts/{role}.yaml
+  - Render system + user messages from YAML templates + caller-supplied vars
+  - Inject confidence instruction automatically when schema has confidence field
   - Apply NoWait logit bias for 35B planning calls
   - Apply LLMLingua-2 compression on eligible content
   - Handle thinking mode toggle and budget_tokens
   - Capture thinking output to log file
-  - Extract <confidence> tag from thinking output
+  - Extract <confidence> tag from thinking output and attach to result
   - Retry via Instructor on malformed structured output
   - Emit structured stage log entry on every call
 """
@@ -49,6 +52,19 @@ Observation: the result of the action
 Thought: I now know the final answer
 Final Answer: the final answer to the original input question
 """
+
+# ── Confidence instruction injected automatically when schema has the field ───
+# Placed at the end of the system prompt so it doesn't crowd the main content.
+_CONFIDENCE_INSTRUCTION = """
+CONFIDENCE AND CLARIFICATION:
+If you have enough information to proceed, set confidence="high" or "medium" and
+leave clarification_question as null.
+Only set confidence="low" when the task is genuinely ambiguous in a way that would
+cause the wrong output — and populate clarification_question with a single specific
+question whose answer would resolve it.
+Do NOT set low confidence for stylistic preferences or minor implementation details.
+"""
+
 
 # ── Config loading ─────────────────────────────────────────────────────────────
 
@@ -109,6 +125,120 @@ def resolve_role(role: str) -> str:
     if role not in cfg["roles"]:
         raise ValueError(f"Unknown role '{role}'. Check config/models.yaml roles section.")
     return cfg["roles"][role]
+
+
+# ── Prompt loading ─────────────────────────────────────────────────────────────
+
+_prompt_cache: dict[str, dict] = {}
+
+def load_prompt(role: str) -> dict:
+    """
+    Load and cache the YAML prompt definition for a role.
+
+    Looks for: config/prompts/{role}.yaml
+    Returns the parsed YAML dict, or an empty dict if not found.
+    The dict may contain:
+      system        — system prompt string (may contain {template_vars})
+      user_template — user message template string (may contain {template_vars})
+      thinking      — bool override (optional; overridden by call_role kwargs)
+      budget_tokens — int override (optional; overridden by call_role kwargs)
+    """
+    if role in _prompt_cache:
+        return _prompt_cache[role]
+
+    prompt_path = Path(__file__).parent.parent / "config" / "prompts" / f"{role}.yaml"
+    if not prompt_path.exists():
+        log.debug("No prompt YAML found for role '%s' at %s", role, prompt_path)
+        _prompt_cache[role] = {}
+        return {}
+
+    with open(prompt_path, encoding="utf-8") as f:
+        data = yaml.safe_load(f) or {}
+
+    _prompt_cache[role] = data
+    log.debug("Loaded prompt YAML for role '%s'", role)
+    return data
+
+
+def build_messages_from_prompt(
+    role:             str,
+    template_vars:    dict,
+    response_schema:  Optional[Type[BaseModel]] = None,
+    extra_messages:   Optional[list[dict]]      = None,
+) -> list[dict]:
+    """
+    Build a messages list from a role's YAML prompt definition.
+
+    Args:
+        role:            Role name (e.g. 'plan', 'draft', 'classify')
+        template_vars:   Variables to substitute into system/user templates.
+                         Missing keys are left as-is (no KeyError).
+        response_schema: If the schema has a 'confidence' field,
+                         the confidence instruction is appended to the system prompt.
+        extra_messages:  Additional messages to append after system+user
+                         (used for retry loops, multi-turn, etc.)
+
+    Returns:
+        List of {role, content} dicts ready for the model.
+
+    Raises:
+        ValueError: if no YAML exists for this role and no extra_messages supplied.
+    """
+    prompt = load_prompt(role)
+
+    if not prompt and not extra_messages:
+        raise ValueError(
+            f"No prompt YAML found for role '{role}' and no messages supplied. "
+            f"Create config/prompts/{role}.yaml or pass messages directly."
+        )
+
+    messages: list[dict] = []
+
+    # ── System prompt ──────────────────────────────────────────────────────────
+    system_text = prompt.get("system", "")
+    if system_text:
+        # Safe format — ignore missing keys rather than raising KeyError
+        system_text = _safe_format(system_text, template_vars)
+
+        # Append confidence instruction if schema supports it
+        if response_schema is not None and _schema_has_confidence(response_schema):
+            system_text = system_text.rstrip() + "\n" + _CONFIDENCE_INSTRUCTION
+
+        messages.append({"role": "system", "content": system_text})
+
+    # ── User message ───────────────────────────────────────────────────────────
+    user_template = prompt.get("user_template", "")
+    if user_template:
+        user_text = _safe_format(user_template, template_vars)
+        messages.append({"role": "user", "content": user_text})
+
+    # ── Extra messages (retry turns, multi-turn context) ───────────────────────
+    if extra_messages:
+        messages.extend(extra_messages)
+
+    return messages
+
+
+def _safe_format(template: str, vars: dict) -> str:
+    """
+    Format a template string with vars, leaving unresolved {keys} intact.
+    Prevents KeyError when a template has optional slots.
+    """
+    try:
+        return template.format_map(_DefaultDict(vars))
+    except Exception:
+        return template
+
+
+class _DefaultDict(dict):
+    """Returns the key wrapped in braces for missing keys — safe format_map."""
+    def __missing__(self, key):
+        return "{" + key + "}"
+
+
+def _schema_has_confidence(schema: Type[BaseModel]) -> bool:
+    """Return True if the schema has a 'confidence' field."""
+    return "confidence" in schema.model_fields
 
 
 # ── Thinking capture ───────────────────────────────────────────────────────────
@@ -203,16 +333,7 @@ def compress_text(
     """
     Compress text using LLMLingua-2 if available and content is long enough.
     Never compress code — callers are responsible for separating code from prose.
-
-    Args:
-        text:       Text to compress (prose only, not code)
-        ratio:      Target compression ratio (0.5 = keep 50% of tokens)
-        min_tokens: Skip compression if content is below this token estimate
-
-    Returns:
-        Compressed text, or original text if compression unavailable/skipped.
     """
-    # Rough token estimate: 1 token ≈ 4 chars
     estimated_tokens = len(text) / 4
     if estimated_tokens < min_tokens:
         return text
@@ -251,10 +372,10 @@ def _log_stage_entry(
     tokens_out: int,
     latency_ms: float,
     status:     str,
-    retries:    int = 0,
-    load_ms:    float = 0.0,     # NEW
-    ttft_ms:    float = 0.0,     # NEW
-    think_ratio:float = 0.0,     # NEW
+    retries:    int   = 0,
+    load_ms:    float = 0.0,
+    ttft_ms:    float = 0.0,
+    think_ratio:float = 0.0,
 ) -> None:
     """Append one line to {run_dir}/stages.log and push to Langfuse"""
     log_path = Path(run_dir) / "stages.log"
@@ -274,8 +395,7 @@ def _log_stage_entry(
     }
     with open(log_path, "a", encoding="utf-8") as f:
         f.write(json.dumps(entry) + "\n")
-        
-    # Inject granular metrics natively into the active LangGraph/Langchain trace
+
     try:
         from langfuse.decorators import langfuse_context
         langfuse_context.update_current_observation(
@@ -287,7 +407,7 @@ def _log_stage_entry(
             tags=[stage, model_name]
         )
     except ImportError:
-        pass # Langfuse SDK not installed or not in context
+        pass
 
 
 # ── Streaming completion helper ───────────────────────────────────────────────
@@ -307,8 +427,7 @@ def _stream_completion(
     think_toks  = 0
     usage       = None
     last_log    = 0
-    
-    # NEW: Telemetry trackers
+
     start_ts    = time.perf_counter()
     ttft_ms     = 0.0
 
@@ -323,7 +442,6 @@ def _stream_completion(
         )
 
         for chunk in stream:
-            # Capture TTFT on the very first chunk
             if ttft_ms == 0.0:
                 ttft_ms = (time.perf_counter() - start_ts) * 1000
 
@@ -358,8 +476,6 @@ def _stream_completion(
 
     full_content = "".join(chunks)
     log.debug("[%s] completed: %d total tokens", stage, token_count)
-    
-    # Return the new telemetry data alongside the content
     return full_content, usage, ttft_ms, think_toks, token_count
 
 
@@ -383,23 +499,19 @@ def call_model(
 
     Args:
         model_id:        Model identifier from models.yaml (e.g. '9b', '35b')
-                         OR a role name resolved via resolve_role() first.
-        messages:        List of {"role": ..., "content": ...} dicts.
+        messages:        List of {role, content} dicts (already built).
         response_schema: Pydantic model class to parse the response into.
         stage:           Pipeline stage name for logging (e.g. 'plan', 'draft').
         run_dir:         Path to the current run directory for log files.
         thinking:        Override thinking mode. None = use model default.
-        budget_tokens:   Override thinking budget. None = use model default.
+        budget_tokens:   Override thinking budget. None = use routing.yaml value.
         compress_system: If True, apply LLMLingua-2 to system message content.
         compress_ratio:  Compression ratio if compress_system is True.
         max_retries:     Instructor retry attempts on malformed output.
+        skip_nowait:     If True, skip NoWait logit bias (e.g. chess reasoning).
 
     Returns:
         Populated instance of response_schema.
-
-    Raises:
-        instructor.exceptions.InstructorRetryException: if all retries exhausted
-        ValueError: if model_id is unknown
     """
     cfg        = get_model_config(model_id)
     base_url   = cfg["base_url"]
@@ -407,9 +519,7 @@ def call_model(
     temp       = cfg.get("temperature", 0.6)
     top_p      = cfg.get("top_p", 0.95)
 
-    # Ensure the model server is running before making the call.
-    # On single-GPU setups this may stop the previous model first.
-    # ── 1. Measure Model Load Time (VRAM Flash-Swap tracking) ──
+    # ── Model load (VRAM swap tracking) ───────────────────────────────────────
     load_start = time.perf_counter()
     try:
         from clients.model_manager import ensure_model_loaded
@@ -418,6 +528,7 @@ def call_model(
         log.warning("model_manager.ensure_model_loaded failed: %s", e)
     load_ms = (time.perf_counter() - load_start) * 1000
 
+    # ── 35B tool-use prefix ───────────────────────────────────────────────────
     if "35b" in model_id.lower() and response_schema:
         for msg in messages:
             if msg.get("role") == "system":
@@ -425,49 +536,48 @@ def call_model(
                     msg["content"] = _QWEN_TOOL_SYSTEM_PROMPT + "\n\n" + msg["content"]
                 break
 
-    # Resolve thinking settings
+    # ── Thinking settings ─────────────────────────────────────────────────────
     thinking_default = cfg.get("thinking", {}).get("default_on", False)
     use_thinking     = thinking if thinking is not None else thinking_default
-    
+
     if budget_tokens is not None:
         tok_budget = budget_tokens
     else:
-        # Apply the stage-specific budget from routing.yaml. 
-        # This overrides models.yaml defaults!
         tok_budget = _get_thinking_budget(stage)
 
-    # Apply LLMLingua-2 compression to system message if requested
+    # ── LLMLingua-2 compression ───────────────────────────────────────────────
     if compress_system:
         for msg in messages:
             if msg.get("role") == "system":
-                msg["content"] = compress_text(
-                    msg["content"], ratio=compress_ratio
-                )
+                msg["content"] = compress_text(msg["content"], ratio=compress_ratio)
                 break
 
-    # Build prompt hash (for logging — not full content)
+    # ── Prompt hash ───────────────────────────────────────────────────────────
     prompt_str  = json.dumps(messages, sort_keys=True)
     prompt_hash = hashlib.sha256(prompt_str.encode()).hexdigest()[:12]
 
-    # Build extra_body for thinking mode and logit bias
-    # Always send thinking parameter explicitly — omitting it lets the model
-    # decide, which causes Qwen3.5 to think by default on every request.
+    # ── extra_body ────────────────────────────────────────────────────────────
     extra_body: dict[str, Any] = {}
     if use_thinking:
-        extra_body["reasoning_budget"] = tok_budget
-        extra_body["thinking"] = {
-            "type":          "enabled",
-            "budget_tokens":  tok_budget,
-        }
+        # budget_tokens=-1 means unlimited — omit budget_tokens from the
+        # thinking config so llama.cpp imposes no per-call cap.
+        if budget_tokens is not None and budget_tokens >= 0:
+            extra_body["reasoning_budget"] = budget_tokens
+            extra_body["thinking"] = {
+                "type":          "enabled",
+                "budget_tokens": budget_tokens,
+            }
+        else:
+            # -1 or None with thinking=True → unlimited
+            extra_body["thinking"] = {"type": "enabled"}
     else:
         extra_body["thinking"] = {"type": "disabled"}
-        
+
     logit_bias = _build_logit_bias(cfg) if not skip_nowait else None
     if logit_bias:
         extra_body["logit_bias"] = logit_bias
 
-    # Instructor client — long timeout to avoid retry noise during 35B generation
-    _http_timeout = _get_http_timeout()
+    # ── Clients ───────────────────────────────────────────────────────────────
     raw_client = OpenAI(base_url=base_url, api_key="local", max_retries=0, timeout=1200.0)
     client     = instructor.from_openai(raw_client, mode=instructor.Mode.JSON)
 
@@ -475,26 +585,21 @@ def call_model(
     start_ts     = time.perf_counter()
 
     try:
-        # Stream the response so we can log progress and capture thinking.
-        # ── 2. Unpack the updated _stream_completion telemetry variables ──
         raw_content, usage, ttft_ms, think_toks, gen_toks = _stream_completion(
             raw_client, cfg["model_id"], messages, temp, top_p,
             extra_body if extra_body else None, stage
         )
 
-        # Extract thinking block and confidence signal
-        thinking_block, answer, confidence = _extract_thinking(raw_content)
+        thinking_block, answer, confidence_signal = _extract_thinking(raw_content)
 
-        # Write thinking log
         if thinking_block:
             _write_thinking_log(run_dir, stage, thinking_block)
 
-        # Now parse the answer portion via Instructor for schema validation
+        # ── Parse structured output ────────────────────────────────────────
         try:
             result: T = response_schema.model_validate_json(answer)
             retries_used = 0
         except Exception:
-            # Instructor retry: ask model to produce a populated INSTANCE not a schema.
             field_names = list(response_schema.model_fields.keys())
             fields_hint = ", ".join(f'"{f}": <value>' for f in field_names[:6])
             result, completion = client.chat.completions.create_with_completion(
@@ -515,33 +620,33 @@ def call_model(
                 max_retries    = max_retries,
                 temperature    = temp,
             )
-            retries_used = max_retries  # approximate
+            retries_used = max_retries
 
-        # Attach confidence signal if the schema has that field
-        if confidence and hasattr(result, "confidence_signal"):
-            object.__setattr__(result, "confidence_signal", confidence)
+        # ── Attach confidence signal from thinking block ───────────────────
+        # The model writes <confidence>high</confidence> inside <think>.
+        # We propagate it to the schema's confidence field if present and
+        # if the model didn't already populate it with a non-default value.
+        if confidence_signal and _schema_has_confidence(response_schema):
+            existing = getattr(result, "confidence", None)
+            # Only override if model left it at the default "high"
+            # (meaning it didn't express a lower confidence in the JSON body itself)
+            if existing == "high" and confidence_signal.lower() in ("medium", "low"):
+                try:
+                    result.confidence = confidence_signal.lower()
+                except Exception:
+                    pass  # frozen model or validation error — skip
 
-        # ── 3. Calculate Ratio & Log it ──
+        # ── Metrics and logging ────────────────────────────────────────────
         elapsed_ms = (time.perf_counter() - start_ts) * 1000
         tokens_in  = usage.prompt_tokens     if usage else 0
         tokens_out = usage.completion_tokens if usage else 0
-        
-        # Guard against zero-division
         think_ratio = (think_toks / gen_toks) if gen_toks > 0 else 0.0
 
         _log_stage_entry(
-            run_dir=run_dir, 
-            stage=stage, 
-            model_name=model_name, 
-            prompt_hash=prompt_hash,
-            tokens_in=tokens_in, 
-            tokens_out=tokens_out, 
-            latency_ms=elapsed_ms,
-            status="ok", 
-            retries=retries_used,
-            load_ms=load_ms,
-            ttft_ms=ttft_ms,
-            think_ratio=think_ratio
+            run_dir=run_dir, stage=stage, model_name=model_name, prompt_hash=prompt_hash,
+            tokens_in=tokens_in, tokens_out=tokens_out, latency_ms=elapsed_ms,
+            status="ok", retries=retries_used,
+            load_ms=load_ms, ttft_ms=ttft_ms, think_ratio=think_ratio,
         )
 
         log.info(
@@ -553,43 +658,168 @@ def call_model(
         return result
 
     except Exception as exc:
-        # Fallback logging if the stream or the retry fails outright
         elapsed_ms = (time.perf_counter() - start_ts) * 1000
         _log_stage_entry(
-            run_dir=run_dir, 
-            stage=stage, 
-            model_name=model_name, 
-            prompt_hash=prompt_hash,
-            tokens_in=0, 
-            tokens_out=0, 
-            latency_ms=elapsed_ms,
-            status=f"error:{type(exc).__name__}", 
-            retries=retries_used,
-            load_ms=load_ms,
-            ttft_ms=0.0,
-            think_ratio=0.0
+            run_dir=run_dir, stage=stage, model_name=model_name, prompt_hash=prompt_hash,
+            tokens_in=0, tokens_out=0, latency_ms=elapsed_ms,
+            status=f"error:{type(exc).__name__}", retries=retries_used,
+            load_ms=load_ms, ttft_ms=0.0, think_ratio=0.0,
         )
         log.error("[%s] %s call failed: %s", stage, model_name, exc)
         raise
 
 
-# ── Convenience: call by role ─────────────────────────────────────────────────
+# ── call_role — primary interface for all node files ──────────────────────────
 
 def call_role(
     role:            str,
-    messages:        list[dict],
-    response_schema: Type[T],
-    stage:           str,
-    run_dir:         str,
-    thinking:        False,
-    max_retries:     0,
+    messages:        Optional[list[dict]]  = None,
+    response_schema: Optional[Type[T]]     = None,
+    stage:           Optional[str]         = None,
+    run_dir:         str                   = "",
+    thinking:        Optional[bool]        = None,
+    budget_tokens:   Optional[int]         = None,
+    max_retries:     int                   = 3,
+    template_vars:   Optional[dict]        = None,
+    extra_messages:  Optional[list[dict]]  = None,
     **kwargs,
 ) -> T:
     """
-    Like call_model() but resolves role → model_id via models.yaml.
-    Preferred in node files to avoid hardcoding model IDs.
+    Primary interface for all node files. Resolves role → model, builds
+    messages from YAML prompt template, and delegates to call_model().
+
+    Two usage modes:
+
+    MODE A — YAML-driven (preferred for new/migrated nodes):
+        call_role(
+            role="plan",
+            template_vars={"task": task_text, "ideation_block": ideation_str},
+            response_schema=PlanSpec,
+            stage="plan",
+            run_dir=run_dir,
+            thinking=True,
+        )
+        Messages are built automatically from config/prompts/plan.yaml.
+        Confidence instruction is injected if PlanSpec has a confidence field.
+
+    MODE B — Explicit messages (legacy / multi-turn flows):
+        call_role(
+            role="classify",
+            messages=explicit_messages,
+            response_schema=TaskClassification,
+            stage="classify",
+            run_dir=run_dir,
+        )
+        Messages are used as-is. YAML system prompt is prepended if no
+        system message is present in the provided list.
+
+    Args:
+        role:            Role name from models.yaml roles section.
+        messages:        Explicit message list (Mode B). If None, template_vars required.
+        response_schema: Pydantic model to parse response into.
+        stage:           Stage name for logging. Defaults to role if not provided.
+        run_dir:         Run directory path for logs.
+        thinking:        Override thinking mode. None = use YAML/model default.
+        budget_tokens:   Override thinking budget. None = use YAML/routing.yaml value.
+        max_retries:     Instructor retry count.
+        template_vars:   Dict of variables to render into YAML templates (Mode A).
+        extra_messages:  Additional turns appended after system+user (both modes).
+        **kwargs:        Forwarded to call_model() (e.g. skip_nowait, compress_system).
+
+    Returns:
+        Populated instance of response_schema.
     """
     model_id = resolve_role(role)
+    stage    = stage or role
+
+    # ── Ultra mode role remapping ──────────────────────────────────────────
+    # When PIPELINE_ULTRA=1 is set (by run.py --mode ultra), remap pipeline
+    # roles to their ultra_ equivalents. This routes all compute through
+    # 27b_ultra (Qwen3.6-27B MTP, partial VRAM offload) with unlimited budget.
+    # Roles that don't have an ultra equivalent (chess, describe, gatekeeper)
+    # are left unchanged — they still use 9B.
+    _ULTRA_ROLE_MAP = {
+        "plan":              "ultra_plan",
+        "draft":             "ultra_draft",
+        "draft_short":       "ultra_draft",   # short mode also escalates in ultra
+        "appraise":          "ultra_appraise",
+        "critic_a":          "ultra_critic",
+        "critic_b":          "ultra_critic",
+        "synthesis_simple":  "ultra_critic",
+        "synthesis_complex": "ultra_critic",
+        "validate":          "ultra_critic",
+        "final_validate":    "ultra_critic",
+    }
+    if os.environ.get("PIPELINE_ULTRA") and role in _ULTRA_ROLE_MAP:
+        ultra_role = _ULTRA_ROLE_MAP[role]
+        log.debug("Ultra mode: remapping role '%s' → '%s'", role, ultra_role)
+        role     = ultra_role
+        model_id = resolve_role(role)
+        # Override budget to unlimited (-1 → handled in call_model as no cap)
+        if budget_tokens is None:
+            budget_tokens = -1
+
+    # ── Custom pipeline per-step overrides ────────────────────────────────
+    # Set by pipeline/custom_graph.py._wrap_existing_node when a custom
+    # pipeline reuses a built-in node but wants a different model/budget
+    # than that node's normal role assignment. Scoped to a single node
+    # call via a context-managed env var, not a persistent config change.
+    # Takes precedence over ultra remapping — an explicit per-step override
+    # in a custom pipeline definition is a more specific instruction than
+    # the global ultra mode toggle.
+    step_model_override = os.environ.get("PIPELINE_STEP_MODEL_OVERRIDE")
+    if step_model_override:
+        log.debug("Custom pipeline override: role '%s' -> model '%s'", role, step_model_override)
+        model_id = step_model_override
+    step_budget_override = os.environ.get("PIPELINE_STEP_BUDGET_OVERRIDE")
+    if step_budget_override is not None:
+        budget_tokens = int(step_budget_override)
+
+    # ── Resolve thinking mode from YAML if not explicitly overridden ─────────
+    # budget_tokens intentionally NOT read from YAML — routing.yaml is the
+    # single source of truth for all thinking budgets. See thinking_budgets
+    # section in config/routing.yaml.
+    prompt_def = load_prompt(role)
+    if thinking is None and "thinking" in prompt_def:
+        thinking = bool(prompt_def["thinking"])
+
+    # ── Build messages ─────────────────────────────────────────────────────────
+    if messages is None:
+        # Mode A: build from YAML template
+        if not prompt_def:
+            raise ValueError(
+                f"call_role(role='{role}'): no messages supplied and no YAML prompt found. "
+                f"Either pass messages= or create config/prompts/{role}.yaml."
+            )
+        final_messages = build_messages_from_prompt(
+            role            = role,
+            template_vars   = template_vars or {},
+            response_schema = response_schema,
+            extra_messages  = extra_messages,
+        )
+    else:
+        # Mode B: use provided messages
+        # If no system message present, prepend the YAML system prompt if available
+        has_system = any(m.get("role") == "system" for m in messages)
+        if not has_system and prompt_def.get("system"):
+            system_text = _safe_format(prompt_def["system"], template_vars or {})
+            if response_schema and _schema_has_confidence(response_schema):
+                system_text = system_text.rstrip() + "\n" + _CONFIDENCE_INSTRUCTION
+            messages = [{"role": "system", "content": system_text}] + messages
+
+        if extra_messages:
+            messages = messages + extra_messages
+
+        final_messages = messages
+
     return call_model(
-        model_id, messages, response_schema, stage, run_dir, **kwargs
+        model_id        = model_id,
+        messages        = final_messages,
+        response_schema = response_schema,
+        stage           = stage,
+        run_dir         = run_dir,
+        thinking        = thinking,
+        budget_tokens   = budget_tokens,
+        max_retries     = max_retries,
+        **kwargs,
     )

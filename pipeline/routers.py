@@ -58,13 +58,17 @@ def route_after_ideation(state: PipelineState) -> str:
 def route_after_plan(state: PipelineState) -> str:
     """
     After planning: select executor based on mode and decompose flag.
-    decompose=True → sub_spec_runner
+    decompose=True → sub_spec_runner (top-level runs only)
     long mode      → draft (35B)
     short mode     → draft_short (9B)
+
+    Sub-spec runs (is_sub_spec=True) never decompose further — this prevents
+    infinite recursion when a sub-spec task is misclassified as complex.
     """
     classification = state.get("classification")
-    mode    = getattr(classification, "mode", "short") if classification else "short"
-    decompose = state.get("decompose", False)
+    mode      = getattr(classification, "mode", "short") if classification else "short"
+    is_sub    = state.get("is_sub_spec", False)
+    decompose = state.get("decompose", False) and not is_sub
 
     if decompose:
         log.debug("Router: plan → sub_spec_runner")

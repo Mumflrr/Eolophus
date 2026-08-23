@@ -50,7 +50,7 @@ _adopted:        bool                       = False  # True if we found a pre-ex
 
 # ── Models that cannot coexist on 10 GB VRAM ─────────────────────────────────
 
-EXCLUSIVE_MODELS = {"9b", "27b", "35b", "deepcoder", "coder14b"}
+EXCLUSIVE_MODELS = {"9b", "27b", "27b_ultra", "35b", "deepcoder"}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────

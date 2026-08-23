@@ -1,73 +1,131 @@
 """
-nodes/distiller.py — The self-improvement loop.
-Generates a concise lesson if the pipeline had to fix errors before succeeding.
+nodes/distiller.py — self-improvement loop.
+
+Generates a concise lesson if the pipeline had to iterate before succeeding.
+Only fires when iteration > 0 AND final verdict is pass.
+
+Prompt lives in config/prompts/distiller.yaml.
 """
 
 from __future__ import annotations
 
 import logging
+import uuid
 from pydantic import BaseModel, Field
 
 from clients.llm import call_role
 from pipeline.state import PipelineState
 
-# Assuming you have this based on the docstring in critique_store.py
-try:
-    from storage.lesson_store import save_lesson
-except ImportError:
-    # Fallback stub if not implemented yet
-    def save_lesson(task_type: str, tags: list[str], lesson: str) -> None:
-        pass
-
 log = logging.getLogger(__name__)
 
-class DistilledLesson(BaseModel):
-    is_valuable: bool = Field(description="True if the correction teaches a reusable architectural or syntax rule.")
-    lesson_text: str = Field(description="A strict, 1-2 sentence rule on what went wrong and how to do it correctly next time.")
 
-_DISTILLER_SYSTEM = """You are a Principal Engineer distilling knowledge.
-You will be given a validation verdict containing an error and how it was resolved.
-If this is a generic typo, set `is_valuable` to false.
-If this is a framework-specific issue, API mismatch, or architectural flaw, set `is_valuable` to true, and write a strict 1-2 sentence rule in `lesson_text` starting with "Always" or "Never" to prevent this in the future."""
+class DistilledLesson(BaseModel):
+    is_valuable: bool = Field(
+        description=(
+            "True if the correction teaches a reusable architectural or "
+            "framework-specific rule. False for generic typos or formatting."
+        )
+    )
+    lesson_text: str = Field(
+        description=(
+            "A strict 1-2 sentence rule starting with 'Always' or 'Never'. "
+            "Names the specific framework/API/pattern. "
+            "Empty string if is_valuable=False."
+        )
+    )
+
 
 def distiller_node(state: PipelineState) -> dict:
     """
     Look at the run history. If we iterated and succeeded, extract a lesson.
     """
     iteration = state.get("iteration", 0)
-    verdict = state.get("validation_verdict")
-    
-    # Only distill if we actually had to fix something AND we ultimately succeeded
+    verdict   = state.get("validation_verdict")
+
+    # Only distill if we iterated AND ultimately succeeded
     if iteration == 0 or not verdict or verdict.category != "pass":
-        log.debug("Distiller skipped: Run either failed entirely or succeeded on the first try.")
+        log.debug(
+            "Distiller skipped: iteration=%d, verdict=%s",
+            iteration,
+            getattr(verdict, "category", "none"),
+        )
         return {"pipeline_complete": state.get("pipeline_complete", True)}
 
     task_type = state.get("task_type", "coding")
-    tags = state.get("classification", {}).get("tags", []) if state.get("classification") else []
-    
-    # We use the 9B here (role 'plan' or 'validate') because it's already hot in VRAM 
-    # from the final_validate node. No model swap needed!
-    messages = [
-        {"role": "system", "content": _DISTILLER_SYSTEM},
-        {"role": "user", "content": f"Verdict Data:\n{verdict.model_dump_json(indent=2)}"}
-    ]
 
-    log.info("Run required %d iterations. Distilling lesson...", iteration)
-    
     lesson_output: DistilledLesson = call_role(
-        role="validate",  # Mapped to 9B in models.yaml
-        messages=messages,
-        response_schema=DistilledLesson,
-        stage="distill",
-        run_dir=state["run_dir"],
-        thinking=False,
-        budget_tokens=0
+        role            = "distiller",
+        template_vars   = {
+            "iteration":   str(iteration),
+            "verdict_json": verdict.model_dump_json(indent=2),
+        },
+        response_schema = DistilledLesson,
+        stage           = "distill",
+        run_dir         = state["run_dir"],
+        thinking        = False,
     )
 
     if lesson_output.is_valuable and lesson_output.lesson_text:
-        log.info(f"Learned new lesson: {lesson_output.lesson_text}")
-        save_lesson(task_type, tags, lesson_output.lesson_text)
+        log.info("Distilled lesson: %s", lesson_output.lesson_text)
+        _save_lesson(state, task_type, lesson_output.lesson_text)
     else:
-        log.debug("Distiller decided the fix was not universally valuable.")
+        log.debug("Distiller: fix was not universally valuable — skipping")
 
     return {"pipeline_complete": True}
+
+
+def _save_lesson(state: PipelineState, task_type: str, lesson_text: str) -> None:
+    """
+    Construct a full Lesson object and write it to the lesson store.
+    """
+    try:
+        from schemas.lesson import Lesson
+        from storage.lesson_store import write_lesson
+
+        verdict   = state.get("validation_verdict")
+        plan      = state.get("plan_spec")
+        appraisal = state.get("appraisal_report")
+
+        # Derive tags from plan's routing context
+        tags = [task_type]
+        if plan and plan.moe_routing_context:
+            ctx = plan.moe_routing_context.lower()
+            for kw in ["python", "fastapi", "async", "django", "typescript",
+                       "react", "database", "rest", "docker", "testing", "pydantic"]:
+                if kw in ctx:
+                    tags.append(kw)
+
+        # Determine which model caught the issue
+        critique = state.get("critique_record")
+        model_caught = "9b"
+        issue_category = "other"
+        if critique and critique.critic_verdicts:
+            for cv in critique.critic_verdicts:
+                if cv.category != "pass":
+                    model_caught = cv.critic_model
+                    break
+        if appraisal and appraisal.issues:
+            issue_category = appraisal.issues[0].category if appraisal.issues else "other"
+
+        lesson = Lesson(
+            lesson_uuid        = str(uuid.uuid4()),
+            source_run_uuid    = state["run_uuid"],
+            issue_summary      = (
+                verdict.description[:200] if verdict and verdict.description
+                else "Pipeline required correction iterations before passing."
+            ),
+            resolution_pattern = lesson_text,
+            example_context    = None,
+            task_type          = task_type,
+            tags               = list(set(tags)),
+            model_caught       = model_caught,
+            issue_category     = str(issue_category),
+            confidence_score   = 1.0,
+            times_seen         = 1,
+        )
+
+        write_lesson(lesson)
+        log.info("Lesson written to store: %s", lesson.lesson_uuid[:8])
+
+    except Exception as e:
+        log.warning("Failed to write lesson to store: %s", e)

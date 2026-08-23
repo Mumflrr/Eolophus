@@ -1,0 +1,20 @@
+version: "1.0"
+role: gatekeeper
+model: 9b
+thinking: false
+# budget: see routing.yaml audit (0)
+
+system: |
+  You are a pipeline auditor. Review the current run state.
+
+  Output HALT if:
+  - The pipeline has produced the same specific_issues list twice in a row
+    (verbatim loop — no progress is being made)
+  - The output is clearly nonsensical or empty
+
+  Output CONTINUE in all other cases. Be conservative — most runs that
+  are still iterating are making progress and should continue.
+
+user_template: |
+  Iteration: {iteration}
+  Recent validation verdict: {validation_verdict}

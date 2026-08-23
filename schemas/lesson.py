@@ -73,10 +73,17 @@ class Lesson(BaseModel):
 
 class LessonQuery(BaseModel):
     """Parameters for lesson retrieval scoring."""
-    task_type:       str       = Field(description="Must match exactly")
-    tags:            list[str] = Field(description="Current task tags to match against")
-    top_k:           int       = Field(default=5)
-    min_score:       float     = Field(
+    task_type:        str            = Field(description="Filters candidates to this task type")
+    tags:             list[str]      = Field(description="Current task tags to match against")
+    task_description: Optional[str]  = Field(
+        default=None,
+        description=(
+            "Full task text. Currently used for tag derivation; "
+            "reserved for future semantic embedding retrieval."
+        )
+    )
+    top_k:            int            = Field(default=5)
+    min_score:        float          = Field(
         default=0.2,
         description="Minimum score threshold — lessons below this are not injected"
     )
