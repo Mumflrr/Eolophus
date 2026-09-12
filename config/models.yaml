@@ -1,7 +1,13 @@
 # models.yaml — all model configuration
 # Change a model, port, or quant: edit here only. No code changes required.
-# Thinking mode and budget_tokens are per-call overrides; defaults set here.
-# NOTE: budget_tokens are centralized in routing.yaml — not set per-model.
+# Thinking mode default (on/off) is set per-model below via thinking.default_on.
+# Thinking BUDGET (token count) is centralized in routing.yaml's
+# thinking_budgets.<stage> — keyed by stage, not by model, including for
+# escalated calls (a stage escalated to a bigger model keeps using that
+# stage's budget, not one tied to the new model). A per-model budget_tokens
+# field used to live here but was never read by clients/llm.py's
+# _get_thinking_budget() — it was dead weight kept "for reference" and has
+# been removed to avoid a future editor updating the wrong place.
 
 models:
 
@@ -16,7 +22,6 @@ models:
     context_len: 32768
     thinking:
       default_on: false
-      budget_tokens: 4096        # reference only — routing.yaml governs per-stage
     temperature: 0.6
     top_p:       0.95
 
@@ -31,7 +36,6 @@ models:
     context_len: 65536
     thinking:
       default_on: true
-      budget_tokens: 8192
     temperature: 0.6
     top_p:       0.95
     min_p:       0.0             # CRITICAL for Unsloth 3.6 MoE — intentionally disabled
@@ -50,7 +54,6 @@ models:
     context_len: 16384
     thinking:
       default_on: false
-      budget_tokens: 0
     temperature: 0.8
     top_p:       0.95
 
@@ -71,7 +74,6 @@ models:
     context_len: 131072           # large context for overnight tasks
     thinking:
       default_on:   true
-      budget_tokens: -1           # -1 = unlimited (pipeline sets per-call)
     temperature: 0.6
     top_p:       0.95
     mtp:
@@ -92,7 +94,6 @@ models:
     context_len: 16384
     thinking:
       default_on: true
-      budget_tokens: 4096
     temperature: 0.4
     top_p:       0.9
 
@@ -116,18 +117,94 @@ roles:
   validate:          "9b"
   final_validate:    "9b"
   describe:          "9b"
+  # distill and distiller are the same role under two different string
+  # spellings that drifted apart across the codebase: routers.py's
+  # route_after_validate/route_after_final_validate return "distiller"
+  # (matching the distiller.py / distiller_node naming convention used
+  # everywhere else — bugfixer.py/bugfix_node, validator.py/validate_node),
+  # while api.js's ALL_ROLES and this file originally only had "distill".
+  # resolve_role() does an exact string lookup against this roles: map, so
+  # whichever one was missing raised "Unknown role" and crashed the whole
+  # run at the distiller stage. Kept BOTH keys pointing at the same model
+  # rather than picking one, since renaming routers.py's 7 return sites
+  # (or hunting down the distiller_node registration in graph.py) is far
+  # riskier than one extra YAML line. If you later standardize on one
+  # spelling throughout the codebase, the other key here can be removed.
   distill:           "9b"
+  distiller:         "9b"
+  # search_query — added alongside the plan_node fix that extracts a short
+  # keyword query from the raw task before calling search_web(), instead of
+  # sending the full instruction sentence to SearXNG (which returned zero
+  # useful results). Non-thinking, cheap, same model as classify.
+  search_query:       "9b"
   gatekeeper:        "9b"
 
-  # Ultra mode roles — manually triggered only, map to 27b_ultra
-  # All pipeline stages get the same model; budget is set per-stage
-  # in routing.yaml thinking_budgets.ultra_* keys.
-  ultra_plan:            "27b_ultra"
-  ultra_draft:           "27b_ultra"
-  ultra_appraise:        "27b_ultra"
-  ultra_critic:          "27b_ultra"
+  # NOTE: dedicated ultra_plan/ultra_draft/ultra_appraise/ultra_critic roles
+  # (and the _ULTRA_ROLE_MAP indirection in clients/llm.py that remapped
+  # every stage onto them) are retired. The "ultra" pipeline_profile
+  # (config/routing.yaml) now achieves the same effect by walking each
+  # stage's own escalation_ladders[stage] straight to its final entry up
+  # front, rather than forcing every stage onto one dedicated model
+  # regardless of what that stage normally uses. 27b_ultra remains defined
+  # above as a real model and can still appear as a ladder entry for a
+  # role once evaluated for it (see escalation_ladders comment below) —
+  # it just isn't force-mapped onto every role anymore.
   # The 35B would require a VRAM swap from the always-hot 9B, adding 30-60s
   # of dead time to a real-time chess UI. 9B at 512/1024 thinking tokens
   # comfortably handles move classification and tactical pattern recognition.
   chess_fast:        "9b"       # Every-move analysis, 512 thinking tokens
   chess_slow:        "9b"       # Flagged moves (blunders/mirages), 1024 tokens
+
+
+# ── Escalation ladders ────────────────────────────────────────────────────────
+# Per-role sequence of models to escalate to, in order, when a role's
+# CURRENT model either (a) can't finish within the output safety net (see
+# routing.yaml output_token_caps — a generous ceiling, not a per-stage
+# tuning dial) or (b) reports low confidence (TaskClassification.confidence
+# == "low", classify/plan stages only). One step per escalation event —
+# a role that fails again after reaching ladder[0] tries ladder[1], etc.,
+# not a jump straight to the end.
+#
+# CURRENT REALITY (as of this writing): 35b is the only model actually
+# bigger/more capable than what's already assigned to any role, so every
+# ladder below is just ["35b"] or empty. This is NOT a permanent ranking
+# system — there's no tier/capability score here on purpose. As new
+# models get downloaded and benchmarked against the existing ones, add
+# them to a role's list in the order they should actually be tried,
+# based on real judgment about that specific model, not an assumed
+# param-count ordering (27b's IQ2_S quant, for instance, is aggressive
+# enough that it may not actually be an upgrade over 9b — don't add it
+# here on spec; add it once you've evaluated it).
+#
+# roles: entry above is always the starting model — do NOT repeat it as
+# this list's first entry. Start the list at the first NEW model to try.
+#
+# A role with NO entry here (or an empty list) has no escalation path:
+# on failure/low confidence it goes straight to the human-in-the-loop
+# fallback (or, in set-and-forget mode, proceeds with the best available
+# result) rather than trying another model. roles already ON 35b have
+# nothing further to escalate to yet, hence empty lists below, not a
+# missing key — makes explicit "there is currently no next step" rather
+# than looking like an oversight.
+escalation_ladders:
+  vision_decode:      ["35b"]
+  classify:            ["35b"]
+  ideation:            ["35b"]
+  plan:                ["35b"]
+  draft:               []            # already 35b — no bigger model owned yet
+  draft_short:         ["35b"]
+  appraise:            ["35b"]
+  bugfix:              ["35b"]
+  critic_a:            ["35b"]
+  critic_b:            ["35b"]
+  synthesis_complex:   []            # already 35b
+  synthesis_simple:    ["35b"]
+  validate:            ["35b"]
+  final_validate:      ["35b"]
+  describe:            ["35b"]
+  distill:             ["35b"]
+  distiller:           ["35b"]
+  # search_query, gatekeeper, chess_fast, chess_slow: no entry — cheap by
+  # design, not escalated even once 35b or a future model exists (a 3-8
+  # word keyword extraction or a real-time chess move check has nothing
+  # to gain from a bigger, slower model).

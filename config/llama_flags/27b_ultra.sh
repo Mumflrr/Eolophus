@@ -107,4 +107,5 @@ run_and_log "27b_ultra_server.log" \
     -ub 2048 \
     -t "$THREADS" \
     --mlock \
-    --jinja
+    --jinja \
+    -lv 4

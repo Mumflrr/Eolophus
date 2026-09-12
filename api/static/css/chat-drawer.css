@@ -1,0 +1,257 @@
+/* ══════════════════════════════════════════════════════════════════════
+   Chat drawer — run detail's conversation view.
+   Visual language: translucent panel with a label+chevron handle, and
+   assistant turns styled as nested cards (outer bordered card, inner
+   dark sub-card for metadata) per the Engine Analysis / Move History
+   reference. Scroll/click driven rather than drag driven.
+   ══════════════════════════════════════════════════════════════════════ */
+
+.chat-drawer {
+  position: relative;
+  margin-top: 16px;
+  border-radius: var(--r-card);
+  background: var(--glass-fill);
+  backdrop-filter: blur(var(--glass-blur));
+  -webkit-backdrop-filter: blur(var(--glass-blur));
+  border: 1px solid var(--glass-border);
+  box-shadow: var(--shadow-card);
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+  transition: max-height 420ms cubic-bezier(0.22, 1, 0.36, 1);
+  will-change: max-height;
+  max-height: 320px; /* collapsed: handle + last two turns */
+}
+
+.chat-drawer.expanded {
+  max-height: 680px;
+}
+
+.chat-drawer-handle {
+  all: unset;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 16px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.chat-drawer-handle-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  color: var(--text-tertiary);
+}
+
+.chat-drawer-chevron {
+  width: 13px;
+  height: 13px;
+  transition: transform var(--dur-fast) var(--ease);
+  color: var(--text-tertiary);
+}
+
+.chat-drawer-body {
+  flex: 1;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: 2px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  scroll-behavior: smooth;
+}
+
+.chat-replan-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 14px 8px;
+  border-top: 1px solid var(--divider);
+  flex-shrink: 0;
+}
+.chat-replan-row .row-title {
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+
+.chat-input-row {
+  display: flex;
+  gap: 8px;
+  align-items: flex-end;
+  padding: 10px 14px;
+  border-top: 1px solid var(--divider);
+  flex-shrink: 0;
+}
+
+.chat-input-row .textarea-input {
+  flex: 1;
+  min-height: 38px;
+  max-height: 120px;
+  resize: none;
+}
+
+/* ── User turn — simple right-aligned bubble ─────────────────────── */
+
+.chat-bubble-row {
+  display: flex;
+  animation: stage-in var(--dur-med) var(--ease);
+}
+.chat-bubble-row.user { justify-content: flex-end; }
+.chat-bubble-row.assistant { justify-content: flex-start; }
+
+.chat-bubble.user {
+  max-width: 78%;
+  padding: 7px 12px;
+  border-radius: var(--r-control);
+  border-bottom-right-radius: 4px;
+  font-size: 13px;
+  line-height: 1.45;
+  background: var(--c-blue-dim);
+  border: 1px solid var(--c-blue-border);
+  color: var(--text-primary);
+}
+
+.chat-bubble-time {
+  font-size: 10px;
+  color: var(--text-disabled);
+  margin-top: 2px;
+}
+
+/* ── Assistant turn — nested card, per the Engine Analysis reference:
+   outer bordered card + inner dark sub-card for metadata ─────────── */
+
+.chat-card {
+  max-width: 78%;
+  border-radius: var(--r-card);
+  border: 1px solid var(--glass-border);
+  background: var(--glass-fill);
+  padding: 10px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  transition: border-color var(--dur-fast) var(--ease), background var(--dur-fast) var(--ease);
+}
+
+.chat-card.clickable { cursor: pointer; }
+.chat-card.clickable:hover { background: var(--glass-fill-raised); }
+.chat-card.open { border-color: var(--c-blue-border); }
+
+.chat-card-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Node pill — one color per node_id, reusing the same dim/border token
+   trio the rest of the app already uses for tags and badges. */
+.node-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: var(--r-pill);
+  border: 1px solid transparent;
+}
+.node-pill.node-describe { background: var(--c-blue-dim); border-color: var(--c-blue-border); color: var(--c-blue); }
+.node-pill.node-clarify { background: var(--c-purple-dim); border-color: var(--c-purple-border); color: var(--c-purple); }
+.node-pill.node-gatekeeper { background: var(--c-orange-dim); border-color: var(--c-orange-border); color: var(--c-orange); }
+.node-pill.node-plan { background: var(--c-green-dim); border-color: var(--c-green-border); color: var(--c-green); }
+/* Truncation halt (see pipeline/graph.py's _wrap_node_for_truncation_retry
+   and server.py's _post_halt_chat_message, node_id="truncated") — reuses
+   the same orange trio as node-gatekeeper/stage-swap/chat-system-notice,
+   this app's established "needs attention" color, rather than introducing
+   a new one for what is the same category of event (a halt the person
+   needs to act on) as those. */
+.node-pill.node-truncated { background: var(--c-orange-dim); border-color: var(--c-orange-border); color: var(--c-orange); }
+
+.chat-card-time {
+  margin-left: auto;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-disabled);
+}
+
+.chat-card-content {
+  font-size: 13px;
+  line-height: 1.55;
+  color: var(--text-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.chat-card-time-inline {
+  float: right;
+  margin: 1px 0 4px 10px;
+  font-family: var(--font-mono);
+  font-size: 10px;
+  color: var(--text-disabled);
+  white-space: nowrap;
+}
+
+/* Inner dark sub-card — appears only once a card's detail is open,
+   mirroring the reference's nested analysis-notes block. */
+.chat-card-detail {
+  border-radius: var(--r-control);
+  background: rgba(0, 0, 0, 0.22);
+  border: 1px solid var(--glass-border);
+  padding: 12px 14px;
+}
+.chat-card-detail-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 10.5px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-tertiary);
+  margin-bottom: 8px;
+}
+.chat-card-detail-body {
+  font-family: var(--font-mono);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.chat-card-expand-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-tertiary);
+}
+.chat-card-expand-row .chev {
+  width: 12px;
+  height: 12px;
+  transition: transform var(--dur-fast) var(--ease);
+}
+.chat-card.open .chat-card-expand-row .chev { transform: rotate(90deg); }
+
+/* ── System notice — inline divider, not a bubble from either party ── */
+
+.chat-system-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 8px 12px;
+  border-radius: var(--r-control);
+  background: var(--c-orange-dim);
+  border: 1px solid var(--c-orange-border);
+  font-size: 11.5px;
+  color: var(--text-secondary);
+  align-self: center;
+}
+.chat-system-notice .icon { color: var(--c-orange); }

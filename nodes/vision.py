@@ -71,6 +71,9 @@ def vision_decode_node(state: PipelineState) -> dict:
         },
     ]
 
+    profile = state.get("profile") or state.get("requested_profile")
+    current_model_override = (state.get("escalated_models") or {}).get("vision_decode")
+
     description: VisualDescription = call_role(
         role            = "vision_decode",
         messages        = messages,
@@ -79,17 +82,44 @@ def vision_decode_node(state: PipelineState) -> dict:
         run_dir         = run_dir,
         thinking        = False,
         max_retries     = 0,
+        profile         = profile,
+        current_model_override = current_model_override,
     )
 
+    escalated_models   = dict(state.get("escalated_models") or {})
+    escalation_history = list(state.get("escalation_history") or [])
+    escalated_to_attr  = getattr(description, "_escalated_to", None)
+    if escalated_to_attr:
+        escalated_from_attr = getattr(description, "_escalated_from", None)
+        escalated_models["vision_decode"] = escalated_to_attr
+        escalation_history.append({
+            "stage":      "vision_decode",
+            "from_model": escalated_from_attr,
+            "to_model":   escalated_to_attr,
+            "trigger":    "low_confidence" if description.confidence != "low" else "truncation",
+            "iteration":  state.get("iteration", 0),
+        })
+        log.info("Vision decode escalated %s → %s", escalated_from_attr, escalated_to_attr)
+
+    human_in_the_loop = state.get("human_in_the_loop", True)
     if description.confidence == "low" and description.clarification_question:
+        if human_in_the_loop:
+            log.warning(
+                "Vision decode halted — needs human input: %s",
+                description.clarification_question
+            )
+            return {
+                "pipeline_halted":      True,
+                "clarification_needed": description.clarification_question,
+                "escalated_models":     escalated_models,
+                "escalation_history":   escalation_history,
+            }
         log.warning(
-            "Vision decode halted — needs human input: %s",
-            description.clarification_question
+            "Vision decode confidence=low after escalation exhausted, but "
+            "human_in_the_loop=False (set-and-forget) — proceeding "
+            "best-effort. Original question was: %s",
+            description.clarification_question,
         )
-        return {
-            "pipeline_halted":      True,
-            "clarification_needed": description.clarification_question,
-        }
 
     log.info(
         "Vision decode: %s — %d elements | %d requirements",
@@ -117,4 +147,6 @@ def vision_decode_node(state: PipelineState) -> dict:
     return {
         "visual_description": description,
         "normalised_input":   "\n".join(parts),
+        "escalated_models":   escalated_models,
+        "escalation_history": escalation_history,
     }

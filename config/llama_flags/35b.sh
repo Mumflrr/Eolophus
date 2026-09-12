@@ -25,11 +25,10 @@ run_and_log "35b_server.log" \
     --host 127.0.0.1 \
     -ot ".ffn_.*_exps.=CPU" \
     -ngl 99 \
-    -ctk turbo3 \
-    -ctv turbo3 \
     -fa "$STD_FLASH_ATTN" \
     -b 2048 \
     -ub 2048 \
     -t "$THREADS" \
     --mlock \
-    --jinja
+    --jinja \
+    -lv 4

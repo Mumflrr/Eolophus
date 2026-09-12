@@ -54,22 +54,78 @@ thinking_budgets:
   chess_fast:  512    # Every-move analysis — fast
   chess_slow:  1024   # Flagged moves (blunders, mirages, sacrifices) — deeper
 
+# ── Output token caps (generous safety net, not a per-stage tuning dial) ─────
+# Separate from thinking_budgets above — this caps the *answer* itself via
+# max_tokens on the API call, not the thinking block. Added after a describe
+# task generated 21k+ tokens and ran past the (former) 300s client timeout
+# with nothing else to stop it — thinking_budgets.describe=512 only guides
+# the thinking phase and isn't a hard stop on total output. Applies per role;
+# a role not listed here gets no cap (unbounded, previous behaviour).
+#
+# Reframed under the escalation design (see docs/pipeline-profile-escalation-
+# design.md §2.5): hitting this cap no longer halts the run for a human to
+# manually retry via POST /run/{uuid}/retry-truncated. It's now ONE of the
+# two escalation triggers (the other being TaskClassification.confidence ==
+# "low") — hitting it walks the stage's escalation_ladders[stage] (see
+# models.yaml) to the next model, same one-step-at-a-time mechanism as a
+# low-confidence escalation. TruncatedOutputError itself, the sentinel file,
+# and the manual /retry-truncated endpoint all stay in place (kept
+# deliberately — see clients/llm.py's escalation-walk comment) for the case
+# where a role has no ladder left, or a person genuinely wants a higher hard
+# cap than any ladder step would apply on its own.
+#
+# Because a hit now escalates instead of halting, these should be set an
+# order of magnitude above what the stage legitimately needs — they exist
+# to catch genuine runaway generation (a `describe` call that produced 21k+
+# tokens, a `search_query` call that produced 10k+ for what should be a few
+# words), not to bound normal output.
+output_token_caps:
+  describe:     16000   # direct-answer node — was 4096; raised so a normal
+                         # (non-runaway) long describe answer never trips this
+  search_query: 4096     # 3-8 word keyword query as JSON — genuinely tiny,
+                         # no legitimate reason to grow this one
+  plan:         24000    # PlanSpec generation on 9b/35b — architectural
+                         # output can run long on complex/decomposed tasks
+  draft:        32000    # code emission — the single stage most likely to
+                         # need real headroom before this is a legitimate hit
+  appraise:     16000
+  bugfix:       16000
+  critic_a:     8000
+  critic_b:     16000
+  synthesise:   16000
+  validate:     8000
+  final_validate: 8000
+  classify:     4000     # structured TaskClassification JSON — small by design
+
 
 # ── Correction loop ──────────────────────────────────────────────────────────
 correction_loop:
   max_iterations:        4      # After this many iterations, return unresolvable
-  # Per mode: where does minor_fix route?
+  # Keyed by active pipeline_profile name (state["profile"]), not
+  # classification.mode — mode is now an informational hint only (see
+  # pipeline_profiles above). "ultra" is intentionally absent: it inherits
+  # "long"'s entry via routers.py's minor_fix_target lookup falling back to
+  # "long" for any profile other than short/medium, since ultra shares
+  # long's node_set. medium routes to bugfix like short, since medium's
+  # node_set also has no full-redraft stage of its own to target.
   minor_fix_target:
-    long:  "draft"              # Re-route to 35B for full redraft
-    short: "bugfix"             # Re-route to coder14b for in-place fix
+    long:   "draft"              # Re-route to 35B for full redraft
+    short:  "bugfix"             # Re-route to coder14b for in-place fix
+    medium: "bugfix"              # medium has no separate redraft stage
 
 # ── Ensemble triggers ────────────────────────────────────────────────────────
 ensemble:
   enabled:              true    # Master switch; false = never run ensemble
   trigger_on_complexity:        # Run ensemble when complexity meets threshold
     - "complex"
-  trigger_on_mode:
+  # Keyed by active pipeline_profile name (state["profile"]), not
+  # classification.mode. Ensemble only exists as a node in long/ultra's
+  # node_set anyway (see pipeline_profiles above) — short/medium's node_set
+  # has no critic_a/critic_b nodes to route to at all, so this trigger list
+  # is somewhat academic for them, but kept explicit rather than assumed.
+  trigger_on_profile:
     - "long"
+    - "ultra"
   always_run_critic_a:  true    # 9B coherence always runs if ensemble fires
   run_critic_b:         true    # DeepCoder correctness — optional
   # Final iteration behaviour: always run full ensemble before giving up
@@ -123,28 +179,120 @@ final_validation:
 http:
   timeout_seconds: 7200
 
-# ── Ultra mode ────────────────────────────────────────────────────────────────
-# Manually triggered overnight deep-thinking mode.
-# Uses Qwen3.6-27B-MTP with partial VRAM offload and near-unlimited think budget.
+# ── Pipeline profiles ─────────────────────────────────────────────────────────
+# Replaces the old TaskClassification.mode ("short"|"long") + PIPELINE_ULTRA +
+# PIPELINE_FORCE_SHORT env-var trio as the thing that decides pipeline SHAPE.
+# See docs/pipeline-profile-escalation-design.md for the full design.
 #
-# Trigger via run.py: pass --mode ultra or set PIPELINE_ULTRA=1
-# The pipeline will:
-#   1. Stop the currently hot model (9B) via model_manager
-#   2. Load 27b_ultra (partial offload — most layers in system RAM)
-#   3. Route all stages through ultra_* roles
-#   4. Set thinking budget to -1 (unlimited) for all stages
-#   5. On completion, stop 27b_ultra and reload 9B
+# A profile is a named bundle of TWO independent things:
+#   1. node_set   — which stages exist in the graph for this run (fixed for
+#                   the whole run; escalation never changes this)
+#   2. role_overrides — which model handles each stage, overriding models.yaml's
+#                   roles: map for the duration of this run. Escalation can
+#                   still move a stage further up its ladder mid-run from
+#                   whatever this sets as the starting point.
 #
-# Do NOT trigger during interactive use — VRAM swap + RAM-resident layers
-# means generation is ~10-20 tok/s. This is an overnight mode.
-ultra_mode:
-  enabled:              false   # set to true OR pass --mode ultra at runtime
-  force_long_mode:      true    # always run 35B-equivalent pipeline depth
-  force_ensemble:       true    # always run full critic ensemble
-  max_iterations:       8       # double the normal correction loop limit
-  model:                "27b_ultra"
-  thinking_budget:      -1      # unlimited — practical limit is context_len
-  note: >
-    Requires MTP-capable GGUF and llama.cpp built from PR #22673.
-    See config/llama_flags/27b_ultra.sh for hardware tuning.
-    Expected throughput: 14-25 tok/s with MTP on 8-10GB VRAM card.
+# classification.mode (TaskClassification) is now an informational hint only
+# — it no longer drives routing directly. pipeline/routers.py consults the
+# active profile (state["profile"]) instead of classification.mode.
+#
+# Auto-selection (profile: "auto"): resolved once, at classify_node, from
+# TaskClassification's own output (complexity/task_type/decompose) — see
+# select_profile() in pipeline/routers.py. Auto never re-selects mid-run;
+# once resolved, the chosen profile's node_set is as fixed as if the caller
+# had picked it explicitly. Escalation remains the only mid-run change.
+pipeline_profiles:
+
+  short:
+    description: >
+      Minimal node set — draft → guard → bugfix → validate. No ideation,
+      no ensemble, no sub-spec decompose. Matches the pre-profile
+      draft_short path. Starting models stay whatever models.yaml's
+      roles: map already says (9b/deepcoder) — this profile only trims
+      the node set, it doesn't override models.
+    node_set:
+      - draft_short
+      - bugfix
+      - validate
+    role_overrides: {}     # none — use models.yaml roles: as-is
+
+  medium:
+    description: >
+      Short's node set plus additional stages (ideation, full draft/appraise
+      pass instead of the short-mode combined draft+bugfix), but stays on
+      cheap models for everything except ideation, which uses a
+      highly-quantized small model. New tier — no pre-profile equivalent.
+    node_set:
+      - ideation
+      - plan
+      - draft_short
+      - appraise
+      - bugfix
+      - validate
+    role_overrides:
+      ideation: "27b"       # highly-quantized small model, per design doc §2.1
+      plan:     "9b"
+      draft_short: "9b"
+      appraise: "deepcoder"
+      bugfix:   "deepcoder"
+      validate: "9b"
+
+  long:
+    description: >
+      Full node graph — retries, ensemble, sub-spec decomposition. Matches
+      the pre-profile default long-mode path. Starting models stay whatever
+      models.yaml's roles: map already says.
+    node_set:
+      - ideation
+      - plan
+      - sub_spec_runner
+      - draft
+      - appraise
+      - bugfix
+      - critic_a
+      - critic_b
+      - synthesise
+      - validate
+      - final_validate
+    role_overrides: {}     # none — use models.yaml roles: as-is
+
+  ultra:
+    description: >
+      Same node set as long — ultra does NOT add graph richness, only
+      escalates models (see design doc §2.3: "escalation is upgrade to a
+      bigger model, not add more node-graph richness"). Every stage in
+      long's node_set starts pre-escalated to its own
+      escalation_ladders[stage] FINAL entry (models.yaml) rather than the
+      first NEW model on the ladder — i.e. ultra is "start where a fully
+      escalated long run would end up," not a separate ultra_* model
+      mapping. For a role with an empty ladder (already on 35b, or
+      deliberately unescalated like search_query), ultra leaves it as-is.
+      role_overrides below is therefore left empty on purpose — it's
+      computed at profile-resolution time from escalation_ladders, not
+      hand-listed here, so it never drifts out of sync as ladders change.
+    node_set:
+      - ideation
+      - plan
+      - sub_spec_runner
+      - draft
+      - appraise
+      - bugfix
+      - critic_a
+      - critic_b
+      - synthesise
+      - validate
+      - final_validate
+    role_overrides: {}     # computed from escalation_ladders[stage][-1] at
+                            # resolution time — see resolve_profile() in
+                            # pipeline/routers.py. Do not hand-edit; edit
+                            # the ladders in models.yaml instead.
+    max_iterations: 8       # double the normal correction_loop.max_iterations
+    note: >
+      27b_ultra (Qwen3.6-27B-MTP, partial VRAM offload) may still be the
+      model that ends up loaded for some roles once it's actually on a
+      role's escalation ladder (models.yaml) — see that file's comment on
+      not pre-guessing ladder position. Nothing in this profile forces
+      27b_ultra specifically; it's just one candidate final-rung model.
+      Do NOT trigger ultra during interactive use — a partial-offload model
+      generates far slower than a fully-VRAM-resident one. This remains an
+      overnight / deep-analysis profile.

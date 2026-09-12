@@ -16,16 +16,46 @@ let availablePipelines = [];
 
 const state = {
   pipeline: '',       // '' = built-in pipeline; else a custom pipeline name
-  mode: '',          // '' = auto
+  profile: '',        // '' = auto. Renamed from `mode` — see PROFILES's comment.
   taskType: '',       // '' = auto
-  noEnsemble: false,
+  // noEnsemble REMOVED: ensemble is now fully determined by profile choice
+  // (short/medium have no critic_a/critic_b nodes in their node_set at all
+  // — see routing.yaml's pipeline_profiles — while long/ultra always want
+  // the full ensemble per complexity/trigger_on_profile). A manual skip
+  // toggle sitting alongside profile selection was a second way to reach
+  // the same decision; pick short or medium instead of toggling this off.
   useSearch: false,
+  // human_in_the_loop (design doc §2.6): true (default, matches
+  // RunRequest.human_in_the_loop's server-side default) — low confidence
+  // still eventually halts for clarification once a stage's escalation
+  // ladder is exhausted. false ("set-and-forget") — proceed best-effort
+  // instead of halting.
+  humanInTheLoop: true,
   ultraAck: false,
+  attachments: [],    // [{ filename, content }] — text/code files, read client-side
+  image: null,        // { filename, dataUrl } — single image, routed through vision_decode
 };
 
-const MODES = [
+// Mirrors _ALLOWED_IMAGE_TYPES in server.py — keep in sync.
+const ACCEPTED_IMAGE_TYPES = 'image/png,image/jpeg,image/webp,image/gif';
+const MAX_IMAGE_BYTES = 8 * 1024 * 1024; // 8MB — generous for a screenshot/photo
+
+// Soft cap so a giant paste-in doesn't silently blow the context budget
+// with no feedback — mirrors MAX_ATTACHMENT_CHARS server-side.
+const MAX_ATTACHMENT_BYTES = 2 * 1024 * 1024; // 2MB per file
+const ACCEPTED_EXTENSIONS = '.py,.md,.txt,.json,.js,.jsx,.ts,.tsx,.yaml,.yml,.sh,.csv,.html,.css,.toml,.ini,.log,.rs,.go,.java,.c,.cpp,.h,.rb,.sql';
+
+// RENAMED from MODES under the pipeline-profile design (see
+// docs/pipeline-profile-escalation-design.md) — server.py's RunRequest
+// already sends/reads requested_profile, not mode; mode is now
+// informational-only on TaskClassification and no longer selects
+// pipeline shape. Added "medium" as a real tier (previously only two
+// existed: short/long). Mirrored in runDetail.js as CHAT_PROFILES — keep
+// both in sync.
+const PROFILES = [
   { id: '', label: 'Auto' },
   { id: 'short', label: 'Short' },
+  { id: 'medium', label: 'Medium' },
   { id: 'long', label: 'Long' },
   { id: 'ultra', label: 'Ultra' },
 ];
@@ -45,7 +75,7 @@ export function mount(el) {
   loadPipelines();
   pollTimer = setInterval(loadRuns, 4000);
   unsubHealth = onHealthChange(() => renderQueueBanner());
-  setUltraAmbient(state.mode === 'ultra');
+  setUltraAmbient(state.profile === 'ultra');
 }
 
 export function unmount() {
@@ -79,14 +109,36 @@ function render() {
             </div>
 
             <div style="height:16px"></div>
+            <label class="field-label">Attachments</label>
+            <div id="attachment-list"></div>
+            <label class="btn-ghost" for="attachment-input" style="width:fit-content;cursor:pointer;">
+              ${icon('paperclip')} Attach files
+            </label>
+            <input type="file" id="attachment-input" accept="${ACCEPTED_EXTENSIONS}" multiple style="display:none;">
+            <div class="text-tertiary" style="font-size:11px;margin-top:6px;">
+              Text and code files only — content is included alongside your task.
+            </div>
+
+            <div style="height:16px"></div>
+            <label class="field-label">Image</label>
+            <div id="image-preview"></div>
+            <label class="btn-ghost" for="image-input" style="width:fit-content;cursor:pointer;">
+              ${icon('image')} Attach image
+            </label>
+            <input type="file" id="image-input" accept="${ACCEPTED_IMAGE_TYPES}" style="display:none;">
+            <div class="text-tertiary" style="font-size:11px;margin-top:6px;">
+              One image per run — analysed by the vision model before the rest of the pipeline runs. PNG, JPEG, WebP, or GIF, up to ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB.
+            </div>
+
+            <div style="height:16px"></div>
             <label class="field-label">Pipeline</label>
             <div id="pipeline-picker"></div>
 
             <div id="built-in-only-fields">
               <div style="height:16px"></div>
-              <label class="field-label">Mode</label>
-              <div class="segmented" id="mode-segmented" role="group" aria-label="Mode">
-                ${MODES.map((m) => `<button type="button" data-mode="${m.id}" class="${m.id === 'ultra' ? 'danger' : ''} ${state.mode === m.id ? 'active' : ''}">${m.label}</button>`).join('')}
+              <label class="field-label">Profile</label>
+              <div class="segmented" id="profile-segmented" role="group" aria-label="Profile">
+                ${PROFILES.map((m) => `<button type="button" data-profile="${m.id}" class="${m.id === 'ultra' ? 'danger' : ''} ${state.profile === m.id ? 'active' : ''}">${m.label}</button>`).join('')}
               </div>
               <div id="ultra-warning"></div>
 
@@ -97,12 +149,12 @@ function render() {
               </div>
 
               <div style="height:18px"></div>
-              <div class="toggle-row" style="padding:4px 0;">
+              <div class="toggle-row" style="padding:4px 0;" title="On (default): pause and ask before classify/plan calls a bigger model to try to resolve low confidence or a truncated result. Off: escalate automatically, and if it's still unsure after that, proceed with the best available result instead of stopping to ask.">
                 <div class="card-row-label">
-                  <span class="row-title">Skip ensemble</span>
-                  <span class="row-sub">Bypass critique/synthesis passes for a faster, single-pass run</span>
+                  <span class="row-title">Ask if unsure</span>
+                  <span class="row-sub">Confirm before escalating to a bigger model on low confidence or truncation</span>
                 </div>
-                <button type="button" class="toggle ${state.noEnsemble ? 'on' : ''}" id="toggle-ensemble" aria-pressed="${state.noEnsemble}" aria-label="Skip ensemble"></button>
+                <button type="button" class="toggle ${state.humanInTheLoop ? 'on' : ''}" id="toggle-human-in-the-loop" aria-pressed="${state.humanInTheLoop}" aria-label="Confirm before escalating on low confidence or truncation"></button>
               </div>
             </div>
             <div class="divider"></div>
@@ -149,14 +201,14 @@ async function loadPipelines() {
 }
 
 function wireForm() {
-  document.getElementById('mode-segmented').addEventListener('click', (e) => {
-    const btn = e.target.closest('button[data-mode]');
+  document.getElementById('profile-segmented').addEventListener('click', (e) => {
+    const btn = e.target.closest('button[data-profile]');
     if (!btn) return;
-    state.mode = btn.dataset.mode;
+    state.profile = btn.dataset.profile;
     state.ultraAck = false;
-    document.querySelectorAll('#mode-segmented button').forEach((b) => b.classList.toggle('active', b === btn));
+    document.querySelectorAll('#profile-segmented button').forEach((b) => b.classList.toggle('active', b === btn));
     renderUltraWarning();
-    setUltraAmbient(state.mode === 'ultra');
+    setUltraAmbient(state.profile === 'ultra');
   });
 
   document.getElementById('type-segmented').addEventListener('click', (e) => {
@@ -166,10 +218,10 @@ function wireForm() {
     document.querySelectorAll('#type-segmented button').forEach((b) => b.classList.toggle('active', b === btn));
   });
 
-  document.getElementById('toggle-ensemble').addEventListener('click', (e) => {
-    state.noEnsemble = !state.noEnsemble;
-    e.currentTarget.classList.toggle('on', state.noEnsemble);
-    e.currentTarget.setAttribute('aria-pressed', String(state.noEnsemble));
+  document.getElementById('toggle-human-in-the-loop').addEventListener('click', (e) => {
+    state.humanInTheLoop = !state.humanInTheLoop;
+    e.currentTarget.classList.toggle('on', state.humanInTheLoop);
+    e.currentTarget.setAttribute('aria-pressed', String(state.humanInTheLoop));
   });
   document.getElementById('toggle-search').addEventListener('click', (e) => {
     state.useSearch = !state.useSearch;
@@ -178,8 +230,96 @@ function wireForm() {
   });
 
   document.getElementById('submit-form').addEventListener('submit', onSubmit);
+  document.getElementById('attachment-input').addEventListener('change', onAttachmentChange);
+  document.getElementById('image-input').addEventListener('change', onImageChange);
   renderUltraWarning();
   renderPipelinePicker();
+  renderAttachmentList();
+  renderImagePreview();
+}
+
+async function onImageChange(e) {
+  const file = e.target.files && e.target.files[0];
+  e.target.value = ''; // allow re-selecting the same file later
+  if (!file) return;
+  if (file.size > MAX_IMAGE_BYTES) {
+    toastError(`${file.name} is too large (max ${Math.round(MAX_IMAGE_BYTES / 1024 / 1024)}MB).`);
+    return;
+  }
+  try {
+    const dataUrl = await new Promise((resolve, reject) => {
+      const reader = new FileReader();
+      reader.onload = () => resolve(reader.result);
+      reader.onerror = () => reject(new Error('read failed'));
+      reader.readAsDataURL(file);
+    });
+    state.image = { filename: file.name, dataUrl };
+    renderImagePreview();
+  } catch {
+    toastError(`Couldn't read ${file.name}.`);
+  }
+}
+
+function renderImagePreview() {
+  const mount_ = document.getElementById('image-preview');
+  if (!mount_) return;
+  if (!state.image) {
+    mount_.innerHTML = '';
+    return;
+  }
+  mount_.innerHTML = `
+    <div class="attachment-row" style="display:flex;align-items:center;gap:8px;padding:6px 0;">
+      <img src="${state.image.dataUrl}" alt="" style="width:40px;height:40px;object-fit:cover;border-radius:4px;">
+      <span class="mono" style="font-size:12px;flex:1;">${escapeHtml(state.image.filename)}</span>
+      <button type="button" class="btn-icon" id="remove-image" title="Remove" style="width:20px;height:20px;">${icon('x')}</button>
+    </div>
+  `;
+  document.getElementById('remove-image').addEventListener('click', () => {
+    state.image = null;
+    renderImagePreview();
+  });
+}
+
+async function onAttachmentChange(e) {
+  const files = Array.from(e.target.files || []);
+  e.target.value = ''; // allow re-selecting the same file later
+  for (const file of files) {
+    if (file.size > MAX_ATTACHMENT_BYTES) {
+      toastError(`${file.name} is too large (max ${Math.round(MAX_ATTACHMENT_BYTES / 1024 / 1024)}MB).`);
+      continue;
+    }
+    try {
+      const content = await file.text();
+      state.attachments.push({ filename: file.name, content });
+    } catch {
+      toastError(`Couldn't read ${file.name}.`);
+    }
+  }
+  renderAttachmentList();
+}
+
+function renderAttachmentList() {
+  const mount_ = document.getElementById('attachment-list');
+  if (!mount_) return;
+  if (!state.attachments.length) {
+    mount_.innerHTML = '';
+    return;
+  }
+  mount_.innerHTML = state.attachments.map((a, i) => `
+    <div class="attachment-row" style="display:flex;align-items:center;gap:8px;padding:6px 0;">
+      ${icon('file')}
+      <span class="mono" style="font-size:12px;flex:1;">${escapeHtml(a.filename)}</span>
+      <span class="text-tertiary" style="font-size:11px;">${fmtNumber(new Blob([a.content]).size)} B</span>
+      <button type="button" class="btn-icon" data-remove-attachment="${i}" title="Remove" style="width:20px;height:20px;">${icon('x')}</button>
+    </div>
+  `).join('');
+  mount_.querySelectorAll('[data-remove-attachment]').forEach((btn) => {
+    btn.addEventListener('click', () => {
+      const idx = Number(btn.dataset.removeAttachment);
+      state.attachments.splice(idx, 1);
+      renderAttachmentList();
+    });
+  });
 }
 
 function renderPipelinePicker() {
@@ -199,9 +339,12 @@ function renderPipelinePicker() {
   toggleBuiltInFields();
 }
 
-// mode/task_type/no_ensemble only apply to the built-in pipeline — the
+// profile/task_type only apply to the built-in pipeline — the
 // contract says they're ignored once `pipeline` is set, so hide them
 // rather than let the user configure settings that silently do nothing.
+// (no_ensemble no longer exists as a separate field — see PROFILES's
+// comment on state above; ensemble presence is now fully implied by
+// profile choice.)
 function toggleBuiltInFields() {
   const section = document.getElementById('built-in-only-fields');
   if (!section) return;
@@ -209,14 +352,14 @@ function toggleBuiltInFields() {
   if (state.pipeline) {
     setUltraAmbient(false);
   } else {
-    setUltraAmbient(state.mode === 'ultra');
+    setUltraAmbient(state.profile === 'ultra');
   }
 }
 
 function renderUltraWarning() {
   const mount_ = document.getElementById('ultra-warning');
   if (!mount_) return;
-  if (state.mode !== 'ultra') {
+  if (state.profile !== 'ultra') {
     mount_.innerHTML = '';
     return;
   }
@@ -264,7 +407,7 @@ async function onSubmit(e) {
     toastError('Describe the task before starting a run.');
     return;
   }
-  if (!state.pipeline && state.mode === 'ultra' && !state.ultraAck) {
+  if (!state.pipeline && state.profile === 'ultra' && !state.ultraAck) {
     toastError('Confirm you understand the Ultra mode trade-off first.');
     return;
   }
@@ -279,14 +422,18 @@ async function onSubmit(e) {
     const res = await startRun({
       task,
       pipeline: state.pipeline || null,
-      mode: state.pipeline ? null : (state.mode || null),
+      requested_profile: state.pipeline ? null : (state.profile || null),
       task_type: state.pipeline ? null : (state.taskType || null),
-      no_ensemble: state.pipeline ? false : state.noEnsemble,
       use_search: state.useSearch,
+      human_in_the_loop: state.pipeline ? true : state.humanInTheLoop,
+      attachments: state.attachments,
+      image: state.image ? { filename: state.image.filename, data_url: state.image.dataUrl } : null,
     });
     toastSuccess('Run started.');
     submitting = false;
     setLaunching(false);
+    state.attachments = [];
+    state.image = null;
     location.hash = `#/runs/${res.run_uuid}`;
   } catch (err) {
     toastError(err instanceof ApiError ? err.message : 'Failed to start run.');
@@ -368,7 +515,7 @@ function runRow(r) {
       <span class="badge ${color}">${escapeHtml(titleCase(r.status))}</span>
       <div class="run-task">
         <span class="mono" style="color:var(--text-secondary);font-size:11.5px;">${r.run_uuid.slice(0, 8)}</span>
-        &nbsp;·&nbsp; ${escapeHtml(titleCase(r.mode || 'auto'))} mode
+        &nbsp;·&nbsp; ${escapeHtml(titleCase(r.profile || r.mode || 'auto'))}
         &nbsp;·&nbsp; ${escapeHtml(titleCase(r.task_type || 'auto'))}
         ${r.stage_reached ? `&nbsp;·&nbsp; <span class="text-tertiary">reached ${escapeHtml(r.stage_reached)}</span>` : ''}
       </div>

@@ -19,4 +19,5 @@ run_and_log "deepcoder_server.log" \
     --host 127.0.0.1 \
     -ngl 99 \
     -fa "$STD_FLASH_ATTN" \
-    --jinja
+    --jinja \
+    -lv 4

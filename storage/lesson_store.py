@@ -358,3 +358,72 @@ def count_lessons() -> int:
         return conn.execute("SELECT COUNT(*) as n FROM lessons").fetchone()["n"]
     finally:
         conn.close()
+
+
+# ── Per-chat-turn usage tracking ────────────────────────────────────────────────
+# Distinct from times_retrieved/times_useful (aggregate, run-agnostic counters
+# on the lesson itself). This records WHICH chat turn used WHICH lessons, so
+# the UI can show "3 lessons used" on a specific assistant reply. Deliberately
+# a separate append-only table (lesson_usage) rather than a column on chats,
+# since one turn can use several lessons.
+
+def record_lesson_usage(run_uuid: str, chat_seq: int, results: list[LessonResult]) -> None:
+    """
+    Record that `results` (already-scored LessonResult list, e.g. the
+    output of retrieve_lessons) were injected into the prompt for a
+    specific chat turn. No-ops on an empty list — don't write empty
+    bookkeeping rows for turns that got no lessons.
+    """
+    if not results:
+        return
+    conn = get_conn()
+    try:
+        conn.executemany(
+            """
+            INSERT INTO lesson_usage (run_uuid, chat_seq, lesson_uuid, score)
+            VALUES (?,?,?,?)
+            """,
+            [(run_uuid, chat_seq, r.lesson.lesson_uuid, r.score) for r in results],
+        )
+        conn.commit()
+        log.debug("Recorded usage of %d lessons for run=%s seq=%d", len(results), run_uuid, chat_seq)
+    finally:
+        conn.close()
+
+
+def get_lessons_used_for_chat(run_uuid: str) -> dict[int, list[dict]]:
+    """
+    Return {chat_seq: [lesson dict, ...]} for every turn in this chat that
+    used at least one lesson. Joins lesson_usage -> lessons so the caller
+    gets full lesson content, not just uuids — but tolerates a lesson
+    having been deleted since (LEFT JOIN), since lessons.js supports
+    deletion and usage history shouldn't break because of it.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT lu.chat_seq, lu.lesson_uuid, lu.score, l.*
+            FROM lesson_usage lu
+            LEFT JOIN lessons l ON l.lesson_uuid = lu.lesson_uuid
+            WHERE lu.run_uuid = ?
+            ORDER BY lu.chat_seq ASC, lu.score DESC
+            """,
+            (run_uuid,),
+        ).fetchall()
+    finally:
+        conn.close()
+
+    out: dict[int, list[dict]] = {}
+    for row in rows:
+        d = dict(row)
+        seq = d.pop("chat_seq")
+        if d.get("lesson_uuid") is None:
+            continue  # lesson_uuid from lu should always exist; guard anyway
+        if d.get("tags"):
+            try:
+                d["tags"] = json.loads(d["tags"])
+            except (TypeError, ValueError):
+                pass
+        out.setdefault(seq, []).append(d)
+    return out

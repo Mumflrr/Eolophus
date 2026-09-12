@@ -12,7 +12,7 @@ from __future__ import annotations
 import logging
 
 from langgraph.types import interrupt
-from clients.llm import call_role
+from clients.llm import call_role, TruncatedOutputError, write_iteration_artifact
 from pipeline.state import PipelineState
 from pydantic import BaseModel, Field
 
@@ -25,7 +25,20 @@ class AuditDecision(BaseModel):
 
 
 def gatekeeper_node(state: PipelineState) -> dict:
-    """Evaluates if the pipeline should pause for human review or halt."""
+    """Evaluates if the pipeline should pause for human review or halt.
+
+    Writes audit.json (via write_iteration_artifact, same as
+    bugfixer/validator/drafter) whenever the AI-driven stop call actually
+    succeeds — previously this node wrote NOTHING to disk despite the
+    'audit' stage showing real token counts and retries in the stages
+    timeline: the AuditDecision (decision + reason) only ever went into a
+    log line (on HALT) or straight into in-memory state, with no artifact
+    a person could open the way fixed.json/verdict.json/critique.json can
+    be. Skipped entirely on the except-Exception fallback below, since in
+    that branch no AuditDecision was ever produced — there's nothing
+    to write, and writing a placeholder would misrepresent a failed call
+    as a real audit.
+    """
     run_dir   = state.get("run_dir", "")
     iteration = state.get("iteration", 0)
     verdict   = state.get("validation_verdict")
@@ -45,10 +58,25 @@ def gatekeeper_node(state: PipelineState) -> dict:
             thinking        = False,
         )
 
+        write_iteration_artifact(
+            run_dir, "audit.json", audit.model_dump_json(indent=2), iteration,
+        )
+
         if audit.decision == "HALT":
             log.warning("AI-driven stop triggered: %s", audit.reason)
             return {"_halt_reason": audit.reason, "status": "unresolvable"}
 
+    except TruncatedOutputError:
+        # Let this propagate — previously caught by the bare `except
+        # Exception` below and silently downgraded to "defaulting to
+        # CONTINUE", which meant a truncated gatekeeper call was the one
+        # place in the whole pipeline where truncation was invisible even
+        # in the logs' effect (the run just continued as if gatekeeper had
+        # said CONTINUE on purpose). Re-raising lets pipeline/graph.py's
+        # generic _wrap_node_for_truncation_retry catch it at the node-
+        # wrapper level instead, same as every other node, so it can be
+        # surfaced and retried with a higher cap rather than swallowed.
+        raise
     except Exception as e:
         log.warning("Gatekeeper audit failed, defaulting to CONTINUE: %s", e)
 

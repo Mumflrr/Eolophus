@@ -47,4 +47,4 @@ system: |
 user_template: |
   {lessons_block}Task:
   {task}
-  {ideation_block}{correction_block}
+  {ideation_block}{correction_block}{chat_block}

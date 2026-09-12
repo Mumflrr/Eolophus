@@ -18,6 +18,7 @@ class TaskType(str, Enum):
     CODING   = "coding"
     IDEATION = "ideation"
     MIXED    = "mixed"
+    DESCRIBE = "describe"
 
 
 class Complexity(str, Enum):
@@ -63,6 +64,28 @@ class TaskClassification(BaseModel):
             "Brief explanation of the classification decisions. "
             "Used for debugging misclassifications."
         )
+    )
+    # Added: previously only existed on nodes/classifier.py's own duplicate
+    # TaskClassification class, which classify_node actually built and
+    # returned instead of this one. LangGraph doesn't enforce PipelineState's
+    # TypedDict annotations at runtime, so nothing caught the mismatch on a
+    # fresh run — but the checkpoint serializer bakes in the concrete class's
+    # module path, so a resume deserializes 'nodes.classifier.TaskClassification'
+    # and logs "Deserializing unregistered type ... This will be blocked in a
+    # future version." Consolidating on one class here (and having
+    # nodes/classifier.py import it instead of redefining it) fixes that,
+    # and means clarify's confidence/clarification_question fields and the
+    # "describe" task_type (both load-bearing for existing routing in
+    # pipeline/routers.py) are actually declared where PipelineState expects
+    # TaskClassification to come from, instead of only existing on a class
+    # nothing outside classify_node ever imports.
+    confidence: str = Field(
+        default="high",
+        description="high=proceed. medium=proceed with warning. low=halt and clarify."
+    )
+    clarification_question: Optional[str] = Field(
+        default=None,
+        description="Single specific question to resolve ambiguity. Only when confidence=low."
     )
 
     model_config = {"use_enum_values": True}

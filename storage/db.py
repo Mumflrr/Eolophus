@@ -1,7 +1,7 @@
 """
 storage/db.py — SQLite connection management.
 
-Single database file at $PIPELINE_DB (default: ~/.pipeline/pipeline.db).
+Single database file at $PIPELINE_DB (default: ~/.eolophus/eolophus.db).
 All storage modules import get_conn() from here.
 """
 
@@ -24,7 +24,7 @@ def get_db_path() -> Path:
         if env:
             _DB_PATH = Path(env)
         else:
-            _DB_PATH = Path.home() / ".pipeline" / "pipeline.db"
+            _DB_PATH = Path.home() / ".eolophus" / "eolophus.db"
     return _DB_PATH
 
 

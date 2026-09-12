@@ -1,0 +1,48 @@
+# docker-compose.yml — SearXNG only.
+#
+# Deliberately minimal: no Caddy reverse proxy, no TLS, no separate Redis
+# container. Those matter for a public-facing SearXNG instance; this one
+# is only ever reached from localhost (SEARXNG_URL in server.py / debug_search.py),
+# same as your llama.cpp servers in start_all.sh, so none of that applies.
+#
+# Usage:
+#   docker compose up -d      # start (also creates ./searxng/settings.yml
+#                              #   on first run — see note below)
+#   docker compose down       # stop
+#   docker compose logs -f    # tail logs
+#
+# IMPORTANT — first run only:
+#   SearXNG generates ./searxng/settings.yml itself the first time the
+#   container starts; it won't exist beforehand. After your FIRST
+#   `docker compose up -d`, stop it again (`docker compose down`), then
+#   edit ./searxng/settings.yml to enable JSON output — search for the
+#   `formats:` list under `search:` and add `- json` alongside `- html`.
+#   This step is what avoids the 403 debug_search.py checks for in step 3.
+#   Then `docker compose up -d` again.
+
+services:
+  searxng:
+    image: searxng/searxng:latest
+    container_name: searxng
+    restart: unless-stopped
+    ports:
+      - "8888:8080"   # host:container — 8888 matches server.py's SEARXNG_URL default
+    volumes:
+      - ./searxng:/etc/searxng:rw
+    environment:
+      - SEARXNG_BASE_URL=http://localhost:8888/
+      # Any long random string works — only used to sign session cookies
+      # for SearXNG's own web UI, not for anything the pipeline talks to.
+      - SEARXNG_SECRET_KEY=${SEARXNG_SECRET_KEY:-changeme-generate-your-own}
+    cap_drop:
+      - ALL
+    cap_add:
+      - CHOWN
+      - SETGID
+      - SETUID
+      - DAC_OVERRIDE
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"

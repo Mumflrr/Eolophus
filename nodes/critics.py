@@ -20,7 +20,7 @@ from pathlib import Path
 from clients.llm import call_role
 from pipeline.state import PipelineState
 from schemas.validation import (
-    CritiqueVerdict, CritiqueRecord, CriticScope, VerdictCategory
+    CritiqueVerdict, CritiqueRecord, CriticScope, VerdictCategory, ValidationVerdict
 )
 
 log = logging.getLogger(__name__)
@@ -39,6 +39,9 @@ def critic_a_node(state: PipelineState) -> dict:
 
     start = time.perf_counter()
 
+    profile = state.get("profile") or state.get("requested_profile")
+    current_model_override = (state.get("escalated_models") or {}).get("critic_a")
+
     verdict: CritiqueVerdict = call_role(
         role            = "critic_a",
         template_vars   = {
@@ -50,7 +53,24 @@ def critic_a_node(state: PipelineState) -> dict:
         run_dir         = run_dir,
         thinking        = False,
         max_retries     = 0,
+        profile         = profile,
+        current_model_override = current_model_override,
     )
+
+    escalated_models   = dict(state.get("escalated_models") or {})
+    escalation_history = list(state.get("escalation_history") or [])
+    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
+    if escalated_to_attr:
+        escalated_from_attr = getattr(verdict, "_escalated_from", None)
+        escalated_models["critic_a"] = escalated_to_attr
+        escalation_history.append({
+            "stage":      "critic_a",
+            "from_model": escalated_from_attr,
+            "to_model":   escalated_to_attr,
+            "trigger":    "truncation",
+            "iteration":  state.get("iteration", 0),
+        })
+        log.info("Critic A escalated %s → %s", escalated_from_attr, escalated_to_attr)
 
     verdict = verdict.model_copy(update={
         "critic_model": "qwen3.5-9b",
@@ -64,7 +84,11 @@ def critic_a_node(state: PipelineState) -> dict:
     )
 
     record = _accumulate_verdict(state, verdict)
-    return {"critique_record": record}
+    return {
+        "critique_record":    record,
+        "escalated_models":   escalated_models,
+        "escalation_history": escalation_history,
+    }
 
 
 # ── Critic B ──────────────────────────────────────────────────────────────────
@@ -88,6 +112,9 @@ def critic_b_node(state: PipelineState) -> dict:
             f"not the original draft):\n{appraisal.model_dump_json(indent=2)}"
         )
 
+    profile = state.get("profile") or state.get("requested_profile")
+    current_model_override = (state.get("escalated_models") or {}).get("critic_b")
+
     verdict: CritiqueVerdict = call_role(
         role            = "critic_b",
         template_vars   = {
@@ -100,7 +127,24 @@ def critic_b_node(state: PipelineState) -> dict:
         run_dir         = run_dir,
         thinking        = True,
         max_retries     = 0,     # was max_rtreies (typo) — now correct
+        profile         = profile,
+        current_model_override = current_model_override,
     )
+
+    escalated_models   = dict(state.get("escalated_models") or {})
+    escalation_history = list(state.get("escalation_history") or [])
+    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
+    if escalated_to_attr:
+        escalated_from_attr = getattr(verdict, "_escalated_from", None)
+        escalated_models["critic_b"] = escalated_to_attr
+        escalation_history.append({
+            "stage":      "critic_b",
+            "from_model": escalated_from_attr,
+            "to_model":   escalated_to_attr,
+            "trigger":    "truncation",
+            "iteration":  state.get("iteration", 0),
+        })
+        log.info("Critic B escalated %s → %s", escalated_from_attr, escalated_to_attr)
 
     verdict = verdict.model_copy(update={
         "critic_model": "deepcoder-14b",
@@ -114,7 +158,11 @@ def critic_b_node(state: PipelineState) -> dict:
     )
 
     record = _accumulate_verdict(state, verdict)
-    return {"critique_record": record}
+    return {
+        "critique_record":    record,
+        "escalated_models":   escalated_models,
+        "escalation_history": escalation_history,
+    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -139,12 +187,18 @@ def _accumulate_verdict(
         appraisal_major_count    = appraisal.major_count    if appraisal else 0,
         iq2s_inherited_issues    = appraisal.iq2s_inherited_issues if appraisal else [],
         critic_verdicts          = [verdict],
-        final_verdict            = CritiqueVerdict(
-            critic_model = "pending",
-            scope        = CriticScope.COHERENCE,
-            category     = VerdictCategory.PASS,
-            confidence   = "pending",
-            reasoning    = "pending",
+        # Placeholder, overwritten once the synthesis node actually runs
+        # (route_after_critic_a -> critic_b -> synthesise -> validate).
+        # CritiqueRecord.final_verdict is typed as ValidationVerdict, NOT
+        # CritiqueVerdict — a different schema (synthesis_model/description/
+        # specific_issues vs. critic_model/issues/confidence). Constructing
+        # a CritiqueVerdict here (the previous code) fails Pydantic
+        # validation the moment CritiqueRecord(...) is built below, on
+        # every single run that reaches critic_a — not just on resume.
+        final_verdict            = ValidationVerdict(
+            category         = VerdictCategory.PASS,
+            synthesis_model  = "pending",
+            description      = "pending — awaiting synthesis",
         ),
         resolved         = False,
         total_iterations = state.get("iteration", 0) + 1,

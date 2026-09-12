@@ -21,7 +21,7 @@ import logging
 import time
 from pathlib import Path
 
-from clients.llm import call_role
+from clients.llm import call_role, write_iteration_artifact
 from pipeline.state import PipelineState
 from schemas.validation import (
     CritiqueRecord, CritiqueVerdict, ValidationVerdict,
@@ -36,8 +36,9 @@ log = logging.getLogger(__name__)
 
 def synthesise_node(state: PipelineState) -> dict:
     """Consolidate CritiqueVerdicts into a single ValidationVerdict."""
-    run_dir = state["run_dir"]
-    record  = state.get("critique_record")
+    run_dir   = state["run_dir"]
+    record    = state.get("critique_record")
+    iteration = state.get("iteration", 0)
 
     if not record or not record.critic_verdicts:
         log.debug("synthesise_node: no critics ran — pass-through")
@@ -56,6 +57,9 @@ def synthesise_node(state: PipelineState) -> dict:
 
     start = time.perf_counter()
 
+    profile = state.get("profile") or state.get("requested_profile")
+    current_model_override = (state.get("escalated_models") or {}).get(role)
+
     verdict: ValidationVerdict = call_role(
         role            = role,
         template_vars   = {
@@ -67,7 +71,24 @@ def synthesise_node(state: PipelineState) -> dict:
         run_dir         = run_dir,
         thinking        = False,
         max_retries     = 0,
+        profile         = profile,
+        current_model_override = current_model_override,
     )
+
+    escalated_models   = dict(state.get("escalated_models") or {})
+    escalation_history = list(state.get("escalation_history") or [])
+    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
+    if escalated_to_attr:
+        escalated_from_attr = getattr(verdict, "_escalated_from", None)
+        escalated_models[role] = escalated_to_attr
+        escalation_history.append({
+            "stage":      role,
+            "from_model": escalated_from_attr,
+            "to_model":   escalated_to_attr,
+            "trigger":    "truncation",   # ValidationVerdict has no confidence field
+            "iteration":  iteration,
+        })
+        log.info("Synthesise (%s) escalated %s → %s", role, escalated_from_attr, escalated_to_attr)
 
     elapsed = (time.perf_counter() - start) * 1000
     verdict = verdict.model_copy(update={
@@ -88,8 +109,9 @@ def synthesise_node(state: PipelineState) -> dict:
         "resolved":            verdict.category == VerdictCategory.PASS,
     })
 
-    critique_path = str(Path(run_dir) / "critique.json")
-    Path(critique_path).write_text(record.model_dump_json(indent=2), encoding="utf-8")
+    critique_path = write_iteration_artifact(
+        run_dir, "critique.json", record.model_dump_json(indent=2), iteration,
+    )
 
     try:
         write_critique_record(record)
@@ -100,6 +122,8 @@ def synthesise_node(state: PipelineState) -> dict:
         "critique_record":    record,
         "critique_path":      critique_path,
         "validation_verdict": verdict,
+        "escalated_models":   escalated_models,
+        "escalation_history": escalation_history,
     }
 
 
@@ -124,6 +148,9 @@ def validate_node(state: PipelineState) -> dict:
         if existing_verdict.specific_issues:
             synthesis_context += "Issues: " + "; ".join(existing_verdict.specific_issues)
 
+    profile = state.get("profile") or state.get("requested_profile")
+    current_model_override = (state.get("escalated_models") or {}).get("validate")
+
     verdict: ValidationVerdict = call_role(
         role            = "validate",
         template_vars   = {
@@ -136,7 +163,24 @@ def validate_node(state: PipelineState) -> dict:
         run_dir         = run_dir,
         thinking        = False,
         max_retries     = 0,
+        profile         = profile,
+        current_model_override = current_model_override,
     )
+
+    escalated_models   = dict(state.get("escalated_models") or {})
+    escalation_history = list(state.get("escalation_history") or [])
+    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
+    if escalated_to_attr:
+        escalated_from_attr = getattr(verdict, "_escalated_from", None)
+        escalated_models["validate"] = escalated_to_attr
+        escalation_history.append({
+            "stage":      "validate",
+            "from_model": escalated_from_attr,
+            "to_model":   escalated_to_attr,
+            "trigger":    "truncation",
+            "iteration":  state.get("iteration", 0),
+        })
+        log.info("Validate escalated %s → %s", escalated_from_attr, escalated_to_attr)
 
     current_iteration = state.get("iteration", 0)
     new_iteration     = current_iteration + 1
@@ -156,8 +200,9 @@ def validate_node(state: PipelineState) -> dict:
         except Exception as e:
             log.warning("Failed to update critique resolved flag: %s", e)
 
-    verdict_path = str(Path(run_dir) / "verdict.json")
-    Path(verdict_path).write_text(verdict.model_dump_json(indent=2), encoding="utf-8")
+    verdict_path = write_iteration_artifact(
+        run_dir, "verdict.json", verdict.model_dump_json(indent=2), current_iteration,
+    )
 
     complete = verdict.category in (VerdictCategory.PASS, VerdictCategory.UNRESOLVABLE)
     failed   = verdict.category == VerdictCategory.UNRESOLVABLE
@@ -169,6 +214,8 @@ def validate_node(state: PipelineState) -> dict:
         "pipeline_complete":  complete,
         "pipeline_failed":    failed,
         "failure_reason":     verdict.description if failed else None,
+        "escalated_models":   escalated_models,
+        "escalation_history": escalation_history,
     }
 
 
@@ -225,6 +272,9 @@ def final_validate_node(state: PipelineState) -> dict:
         if violations else ""
     )
 
+    profile = state.get("profile") or state.get("requested_profile")
+    current_model_override = (state.get("escalated_models") or {}).get(role)
+
     verdict: ValidationVerdict = call_role(
         role            = role,
         template_vars   = {
@@ -239,7 +289,24 @@ def final_validate_node(state: PipelineState) -> dict:
         run_dir         = run_dir,
         thinking        = False,
         max_retries     = 0,
+        profile         = profile,
+        current_model_override = current_model_override,
     )
+
+    escalated_models   = dict(state.get("escalated_models") or {})
+    escalation_history = list(state.get("escalation_history") or [])
+    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
+    if escalated_to_attr:
+        escalated_from_attr = getattr(verdict, "_escalated_from", None)
+        escalated_models[role] = escalated_to_attr
+        escalation_history.append({
+            "stage":      role,
+            "from_model": escalated_from_attr,
+            "to_model":   escalated_to_attr,
+            "trigger":    "truncation",
+            "iteration":  state.get("iteration", 0),
+        })
+        log.info("Final validate (%s) escalated %s → %s", role, escalated_from_attr, escalated_to_attr)
 
     log.info(
         "Final validation: %s | compat=%s | components=%d",
@@ -264,6 +331,8 @@ def final_validate_node(state: PipelineState) -> dict:
         "validation_verdict":    verdict,
         "pipeline_complete":     complete,
         "pipeline_failed":       verdict.category == VerdictCategory.UNRESOLVABLE,
+        "escalated_models":      escalated_models,
+        "escalation_history":    escalation_history,
     }
 
 

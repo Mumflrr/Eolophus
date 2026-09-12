@@ -37,6 +37,45 @@ class PipelineState(TypedDict, total=False):
     is_sub_spec:        bool            # True if this is a sub-spec run
     parent_run_uuid:    Optional[str]   # Set if is_sub_spec is True
     iteration:          int             # Correction loop iteration count (0-indexed)
+    # Set from RunRequest.use_search (server.py) / ChatMessageIn's replan
+    # path. Was previously passed into initial_state / turn_state without
+    # being declared here, so LangGraph silently dropped it before any
+    # node could read it — see the custom_step_outputs comment below for
+    # why undeclared top-level keys don't survive. plan_node/ideation_node
+    # should check this and call clients.search.search_web() when true.
+    use_search:         bool
+
+    # ── Pipeline profile & escalation ─────────────────────────────────────────
+    # profile: the resolved pipeline_profiles (routing.yaml) name for this
+    # run — "short" | "medium" | "long" | "ultra". Set once at classify_node
+    # (or immediately after, for "auto" — see select_profile in
+    # pipeline/routers.py) and never changed for the rest of the run; this
+    # is what routers.py now consults instead of classification.mode, which
+    # is informational only going forward. Distinct from
+    # requested_profile below because "auto" needs to record both what the
+    # caller asked for and what it actually resolved to (useful for the
+    # run-detail UI and for debugging auto-selection).
+    profile:             Optional[str]
+    requested_profile:   Optional[str]   # "auto" | "short" | "medium" | "long" | "ultra" — what the caller asked for, before auto-resolution
+    human_in_the_loop:   bool            # False = "set-and-forget": low confidence escalates instead of halting, and proceeds best-effort once the ladder is exhausted rather than waiting on /clarify
+    # Per-stage current-model overrides produced by escalation, keyed by
+    # stage name (e.g. {"draft": "35b"}). A stage with no entry here is
+    # still on whatever models.yaml roles:/the active profile's
+    # role_overrides says. clients/llm.py's call_role() checks this dict
+    # BEFORE falling back to roles:/role_overrides, and updates it (via the
+    # node's returned state dict) every time a stage actually escalates.
+    # Declared as a plain dict (not a per-stage top-level key) per the
+    # custom_step_outputs rule below — a dynamically-named key per stage
+    # would be silently dropped by LangGraph.
+    escalated_models:    dict
+    # Human-readable escalation history for this run, appended to (never
+    # overwritten) each time any stage escalates. Consumed by distiller.py
+    # to make sure the substantive lesson written is about the task, not
+    # the escalation event itself (design doc §2.3) — this list is where
+    # the "it escalated" fact lives instead, kept separate from whatever
+    # distiller.py writes to the lesson store. Each entry:
+    # {"stage": str, "from_model": str, "to_model": str, "trigger": "truncation"|"low_confidence", "iteration": int}
+    escalation_history:  list
 
     # ── Classification ────────────────────────────────────────────────────────
     classification:     Optional[TaskClassification]
@@ -44,6 +83,18 @@ class PipelineState(TypedDict, total=False):
     # ── Raw input ─────────────────────────────────────────────────────────────
     raw_text_input:     Optional[str]
     raw_image_path:     Optional[str]   # Path to uploaded image if visual input
+    # Live (non-excluded) attachments as plain {filename, content} dicts —
+    # same shape _load_live_attachments/_compose_input_with_attachments use
+    # in server.py. Declared here per the custom_step_outputs comment below:
+    # LangGraph only tracks top-level keys declared on this TypedDict, so an
+    # undeclared "attachments" key risked being silently dropped. The main
+    # pipeline doesn't strictly depend on this key surviving — every node
+    # reads attachment content indirectly via normalised_input/raw_text_input,
+    # which server.py composes before invoke() — but distiller.py's
+    # _scrub_attachment_references reads state.get("attachments") directly,
+    # and sub_spec_runner_node (pipeline/graph.py) needs it to fold
+    # attachment content into each sub-spec's own task_input.
+    attachments:        Optional[list[dict]]
 
     # ── Vision stage ──────────────────────────────────────────────────────────
     visual_description: Optional[VisualDescription]
@@ -91,6 +142,12 @@ class PipelineState(TypedDict, total=False):
     failure_reason:     Optional[str]
     pipeline_halted: bool
     clarification_needed: Optional[str]
+    # Set by classify_node when TaskClassification.confidence == "low".
+    # Must be declared here (not just returned from the node) or LangGraph
+    # drops it before clarify_node can read it back out of committed state —
+    # see the long comment in clarify_node (pipeline/graph.py) for how this
+    # was diagnosed.
+    clarification_question: Optional[str]
 
     # ── Custom pipeline bookkeeping ──────────────────────────────────────
     # CRITICAL: LangGraph only tracks top-level keys declared on this

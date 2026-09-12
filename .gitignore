@@ -1,6 +1,8 @@
 # Environment
 .env
 
+config/searxng-settings.yml
+
 # Pipeline run arifacts
 runs/
 

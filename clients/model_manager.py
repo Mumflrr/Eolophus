@@ -55,16 +55,39 @@ EXCLUSIVE_MODELS = {"9b", "27b", "27b_ultra", "35b", "deepcoder"}
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
-def ensure_model_loaded(model_id: str) -> None:
+def ensure_model_loaded(model_id: str) -> bool:
     """
     Ensure the specified model server is running and ready.
     Stops the current model first if a different one is needed.
+
+    Returns True if a real load just happened (fresh spawn, or a
+    flash-swap from a different model) — False if model_id was already
+    the currently-loaded model and this call was a no-op. Callers that
+    want to capture load-time data (e.g. clients/model_memory.py reading
+    the just-written server log for memory buffer sizes) should only do
+    so when this returns True — re-reading the log after a no-op call
+    would just re-report the same numbers from whenever the model
+    actually loaded, misleadingly attributed to the current call.
+
+    NOTE: an ADOPTED server (Case 1 in _load_model — a server already
+    listening on the target port when we checked) returns True here even
+    though this call didn't perform the load itself. That's intentional,
+    not an oversight: we still don't know when that server's log-file
+    load block happened, and log-parsing (clients/model_memory.py) reads
+    "the last load block in the file" regardless — for an adopted server,
+    the log file's last block IS still that server's actual startup, just
+    from an earlier invocation of this process (or a different one
+    entirely). It's the right data, just not freshly produced by THIS
+    call. If you need to distinguish "genuinely fresh spawn" from
+    "adopted", check the module-level _adopted flag separately — this
+    return value answers "is there load data worth reading", not "did
+    THIS call spawn the process".
     """
     global _current_model
 
     if _current_model == model_id:
         log.debug("Model %s already loaded", model_id)
-        return
+        return False
 
     if _current_model in EXCLUSIVE_MODELS and model_id in EXCLUSIVE_MODELS:
         old_port = _current_port
@@ -76,6 +99,7 @@ def ensure_model_loaded(model_id: str) -> None:
         log.info("Loading model: %s", model_id)
 
     _load_model(model_id)
+    return True
 
 
 def _wait_for_port_death(port: int, timeout: int = 10) -> None:
