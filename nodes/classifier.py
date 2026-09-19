@@ -18,12 +18,12 @@ from pathlib import Path
 from clients.llm import (
     call_role, load_prompt, _safe_format, TruncatedOutputError, EscalationNeeded,
 )
-from langgraph.types import interrupt
 from pipeline.state import PipelineState
 from pipeline.routers import select_profile
 from storage.critique_store import write_run
 from schemas.task_classification import TaskClassification
 from typing import Optional
+import openai
 
 log = logging.getLogger(__name__)
 
@@ -73,12 +73,12 @@ def classify_node(state: PipelineState) -> dict:
 
     profile = state.get("profile") or state.get("requested_profile")
     current_model_override = (state.get("escalated_models") or {}).get("classify")
-    # human_in_the_loop now gates ESCALATION itself (design doc §2.6,
-    # corrected): True (default) means call_role must ask before calling
-    # a bigger model, not just before the final halt once the ladder's
-    # exhausted. Passed straight through as require_confirmation — see
-    # EscalationNeeded's docstring in clients/llm.py for the full
-    # ask-then-decide flow implemented in the except block below.
+    # human_in_the_loop gates ESCALATION itself (design doc §2.6, RE-
+    # corrected): True (default) means call_role must not silently call a
+    # bigger model — it raises EscalationNeeded instead, which this node
+    # now turns into a request for human clarification rather than a
+    # yes/no escalation prompt (see the except block below). Passed
+    # straight through as require_confirmation.
     human_in_the_loop = state.get("human_in_the_loop", True)
 
     max_attempts  = 3
@@ -106,81 +106,80 @@ def classify_node(state: PipelineState) -> dict:
             break
 
         except EscalationNeeded as esc:
-            # Ask before escalating (design doc §2.6, corrected). interrupt()
-            # pauses this node's execution — same mechanism clarify_node
-            # uses — and resumes right here with whatever answer the
-            # person gave via POST /clarify (or an equivalent confirm
-            # endpoint). See clarify_node's docstring in pipeline/graph.py
-            # for how interrupt()/Command(resume=...) actually works.
-            answer = interrupt({
-                "question": (
-                    f"Stage 'classify' wants to escalate from '{esc.current_model_id}' "
-                    f"to '{esc.next_model_id}' ({esc.trigger.replace('_', ' ')}). Proceed?"
-                ),
-                "kind":          "escalation_confirmation",
-                "stage":         esc.stage,
-                "from_model":    esc.current_model_id,
-                "to_model":      esc.next_model_id,
-                "trigger":       esc.trigger,
-            })
-            confirmed = str(answer).strip().lower() in ("y", "yes", "true", "1")
+            # Ask for help instead of escalating (design doc §2.6, RE-
+            # corrected): a stage that wants to escalate no longer asks
+            # "should I try a bigger model?" — it asks the person a real,
+            # open-ended clarifying question and re-runs on the SAME
+            # model with their answer folded in, exactly like any other
+            # low-confidence clarification. There is no separate
+            # escalation-confirmation halt, no escalation_confirmation.json,
+            # and no interrupt() call here at all: this except block just
+            # produces a `classification` with confidence="low" and a real
+            # clarification_question, then falls through to the existing
+            # "remaining low confidence" handling below (same code path a
+            # model-authored low-confidence result already goes through),
+            # which is what actually routes to clarify_node. No model
+            # bump ever happens on resume — see esc.trigger branches below.
+            if esc.trigger == "low_confidence":
+                # esc.result is already a validly-parsed TaskClassification
+                # (the low-confidence result call_role intercepted before
+                # it could auto-escalate) — reuse it as-is rather than
+                # fabricating one. If the model already wrote its own
+                # clarification_question, that's real signal about what's
+                # actually ambiguous — keep it. Only fall back to a
+                # generic prompt when the model didn't give us one to work
+                # with (schema allows null even at confidence=low).
+                classification = esc.result
+                if not classification.clarification_question:
+                    classification = classification.model_copy(update={
+                        "clarification_question": (
+                            "I'm not fully confident in this classification "
+                            "and could use more direction before continuing — "
+                            "what would help clarify the task?"
+                        ),
+                    })
+                log.info(
+                    "Classify: low confidence on '%s' — asking for clarification "
+                    "instead of escalating to '%s'",
+                    esc.current_model_id, esc.next_model_id,
+                )
+                break
 
-            if confirmed:
-                log.info("Escalation confirmed for classify: %s → %s",
-                          esc.current_model_id, esc.next_model_id)
-                classification = call_role(
-                    role            = "classify",
-                    messages        = messages,
-                    template_vars   = {"task": task} if messages is None else None,
-                    extra_messages  = extra_messages if extra_messages else None,
-                    response_schema = TaskClassification,
-                    stage           = "classify",
-                    run_dir         = run_dir,
-                    thinking        = False,
-                    max_retries     = 0,
-                    current_model_override = esc.next_model_id,
-                    allow_escalation = False,   # one confirmed step only — no further auto-walk
-                )
-                escalated_models["classify"] = esc.next_model_id
-                escalation_history.append({
-                    "stage":      "classify",
-                    "from_model": esc.current_model_id,
-                    "to_model":   esc.next_model_id,
-                    "trigger":    esc.trigger,
-                    "iteration":  state.get("iteration", 0),
-                    "confirmed":  True,
-                })
-                break
-            else:
-                log.info("Escalation declined for classify — proceeding on '%s' as-is",
-                          esc.current_model_id)
-                if esc.result is not None:
-                    # Low-confidence trigger: esc.result is the already-
-                    # parsed low-confidence TaskClassification — use it
-                    # as final rather than re-calling anything.
-                    classification = esc.result
-                    break
-                # Truncation trigger has no parsed result to fall back to.
-                # Re-run once more, pinned to the SAME model with
-                # allow_escalation=False, so a still-truncating result
-                # propagates as a normal TruncatedOutputError for
-                # graph.py's _wrap_node_for_truncation_retry to catch
-                # (manual higher-cap retry), instead of looping back into
-                # another confirmation prompt for the same declined step.
-                classification = call_role(
-                    role            = "classify",
-                    messages        = messages,
-                    template_vars   = {"task": task} if messages is None else None,
-                    extra_messages  = extra_messages if extra_messages else None,
-                    response_schema = TaskClassification,
-                    stage           = "classify",
-                    run_dir         = run_dir,
-                    thinking        = False,
-                    max_retries     = 0,
-                    current_model_override = esc.current_model_id,
-                    allow_escalation = False,
-                )
-                break
+            # esc.trigger == "truncation": no parsed result to fall back
+            # on (the call never finished), so there's no classification
+            # object to attach a clarification_question to. Re-run once,
+            # pinned to the SAME model with escalation disabled — if it
+            # truncates again, that's a normal TruncatedOutputError for
+            # the loop's own handler a few lines down to catch and
+            # propagate to graph.py's _wrap_node_for_truncation_retry
+            # (the existing "retry with a higher token cap" flow), which
+            # is a genuinely different UI/flow from clarification and the
+            # right place for "the model literally ran out of room" to
+            # land — not a question the person could usefully answer in
+            # words. See the TruncatedOutputError handler a few lines
+            # below for the identical re-run-then-propagate pattern this
+            # mirrors.
+            log.info(
+                "Classify: truncated on '%s' — retrying same model instead "
+                "of escalating to '%s'",
+                esc.current_model_id, esc.next_model_id,
+            )
+            classification = call_role(
+                role            = "classify",
+                messages        = messages,
+                template_vars   = {"task": task} if messages is None else None,
+                extra_messages  = extra_messages if extra_messages else None,
+                response_schema = TaskClassification,
+                stage           = "classify",
+                run_dir         = run_dir,
+                thinking        = False,
+                max_retries     = 0,
+                current_model_override = esc.current_model_id,
+                allow_escalation = False,
+            )
+            break
+
+
 
         except TruncatedOutputError as exc:
             # Item 6 fix (design doc §4): this call site previously let a
@@ -210,6 +209,18 @@ def classify_node(state: PipelineState) -> dict:
             # already exhausted or escalation was disabled, so retrying
             # with the same messages here would not help. Let it propagate.
             raise
+
+        except openai.APIConnectionError as e:
+            log.warning(
+                "Classifier: model server unreachable (attempt %d/%d, likely "
+                "still loading/swapping) — retrying without feedback: %s",
+                attempt + 1, max_attempts, str(e)
+            )
+            if attempt == max_attempts - 1:
+                raise RuntimeError(
+                    f"Classifier: model server never became reachable after {max_attempts} attempts."
+                ) from e
+            # No extra_messages update — nothing to correct, just retry.
 
         except Exception as e:
             log.warning(
@@ -260,22 +271,24 @@ def classify_node(state: PipelineState) -> dict:
     )
 
     # ── Escalation bookkeeping ────────────────────────────────────────────
-    # Two paths populate escalated_models/escalation_history:
-    #   1. human_in_the_loop=True: the EscalationNeeded except block above
-    #      already appended an entry (with confirmed=True) when the person
-    #      said yes. Nothing further to do here in that case.
-    #   2. human_in_the_loop=False (require_confirmation=False passed to
-    #      call_role): call_role auto-escalated internally exactly as
-    #      before and attached _escalated_from/_escalated_to onto the
-    #      result — read those back here, same as the original
-    #      implementation. This folds into run-level state so (a) a later
-    #      re-classify resumes from the escalated model rather than
-    #      restarting at the bottom, and (b) the run-detail UI can show
-    #      the purple escalation badge (design doc §2.7). This is NOT a
-    #      substantive lesson — escalation_history is infra bookkeeping,
-    #      kept separate from whatever distiller.py writes to the lesson
-    #      store, per §2.3's "distiller learns the substantive difference,
-    #      not the escalation event."
+    # escalated_models/escalation_history are populated ONLY by the
+    # human_in_the_loop=False (set-and-forget) path now: call_role auto-
+    # escalated internally exactly as before and attached
+    # _escalated_from/_escalated_to onto the result — read those back
+    # here. This folds into run-level state so (a) a later re-classify
+    # resumes from the escalated model rather than restarting at the
+    # bottom, and (b) the run-detail UI can show the purple escalation
+    # badge (design doc §2.7). This is NOT a substantive lesson —
+    # escalation_history is infra bookkeeping, kept separate from
+    # whatever distiller.py writes to the lesson store, per §2.3's
+    # "distiller learns the substantive difference, not the escalation
+    # event."
+    #
+    # When human_in_the_loop=True, the EscalationNeeded except block above
+    # never escalates at all anymore — it asks for clarification instead
+    # (see that block's comment) — so escalated_models/escalation_history
+    # simply stay as whatever the caller passed in; this block is a no-op
+    # for that path.
     if "classify" not in escalated_models:
         escalated_to_attr = getattr(classification, "_escalated_to", None)
         if escalated_to_attr:
@@ -292,17 +305,17 @@ def classify_node(state: PipelineState) -> dict:
             log.info("Classify escalated %s → %s (set-and-forget)", escalated_from_attr, escalated_to_attr)
 
     # ── Remaining low confidence ────────────────────────────────────────────
-    # By this point, escalation has already been resolved one way or
-    # another: either the person confirmed and we escalated (classification
-    # now reflects the escalated model's output), the person declined (we
-    # accepted the current result as final), there was no ladder to
-    # escalate to at all, or human_in_the_loop=False already auto-escalated
-    # internally with no one to ask. Any confidence=="low" surviving all of
-    # that still needs a final decision:
-    #   human_in_the_loop=True  — halt and surface the question. Either the
-    #     person just declined the escalation offer (so halting instead is
-    #     the natural next step), or there was nothing left on the ladder
-    #     to even offer.
+    # By this point, any need to escalate has already been resolved one
+    # way or another: either the EscalationNeeded except block above
+    # turned it into a clarification question (human_in_the_loop=True —
+    # classification now reflects that, with confidence=="low" and a real
+    # question set), human_in_the_loop=False already auto-escalated
+    # internally above with no one to ask, or there was no ladder to
+    # escalate to in the first place. Any confidence=="low" surviving all
+    # of that still needs a final decision:
+    #   human_in_the_loop=True  — halt and surface the question, whether
+    #     it came from the model's own classification or from the
+    #     ask-for-help path above.
     #   human_in_the_loop=False (set-and-forget) — no one to ask, ever, by
     #     definition. Escalation already happened automatically above if a
     #     ladder existed; if confidence is still low after that, there's no
@@ -315,7 +328,7 @@ def classify_node(state: PipelineState) -> dict:
 
     if classification.confidence == "low" and clarification_question:
         if human_in_the_loop:
-            log.warning("Classifier confidence=low (escalation declined or unavailable): %s",
+            log.warning("Classifier confidence=low — halting for clarification: %s",
                         clarification_question)
         else:
             log.warning(

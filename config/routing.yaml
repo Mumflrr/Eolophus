@@ -95,12 +95,14 @@ output_token_caps:
   synthesise:   16000
   validate:     8000
   final_validate: 8000
-  classify:     4000     # structured TaskClassification JSON — small by design
+  classify:     6000     # structured TaskClassification JSON — small by design
 
 
 # ── Correction loop ──────────────────────────────────────────────────────────
 correction_loop:
   max_iterations:        4      # After this many iterations, return unresolvable
+                                # (default; a profile can override with its own
+                                # max_iterations — see pipeline_profiles.short/ultra)
   # Keyed by active pipeline_profile name (state["profile"]), not
   # classification.mode — mode is now an informational hint only (see
   # pipeline_profiles above). "ultra" is intentionally absent: it inherits
@@ -215,6 +217,12 @@ pipeline_profiles:
       - bugfix
       - validate
     role_overrides: {}     # none — use models.yaml roles: as-is
+    # Per-profile correction-loop cap; overrides correction_loop.max_iterations
+    # for this profile only (see _max_iterations in pipeline/routers.py).
+    # The loop stops once iteration >= this, so 0 = draft -> ONE bugfix pass
+    # -> validate -> done. Raise to 1 to allow a single validator-driven
+    # retry. Delete the line to inherit correction_loop.max_iterations.
+    max_iterations: 0
 
   medium:
     description: >

@@ -490,8 +490,19 @@ function renderList(runs) {
       const isDelete = btn.dataset.action === 'delete';
       btn.disabled = true;
       try {
-        await cancelRun(uuid);
-        toastSuccess(isDelete ? 'Run deleted.' : 'Run cancelled.');
+        // Toast off the SERVER's response, not off which icon happened to
+        // render. remove_run's cancellable-status branch only cancels —
+        // it returns {status:'cancelled'}, not 'deleted' — even when the
+        // button showing was the trash icon (e.g. a
+        // waiting_for_truncation_retry row). Reporting "Run deleted."
+        // here regardless of what the server actually did hid the fact
+        // that a second click was still needed.
+        const res = await cancelRun(uuid);
+        if (res && res.status === 'cancelled') {
+          toastSuccess('Run cancelled — click delete again to remove it.');
+        } else {
+          toastSuccess('Run deleted.');
+        }
         loadRuns();
       } catch (err) {
         toastError(err instanceof ApiError ? err.message : (isDelete ? 'Could not delete run.' : 'Could not cancel run.'));
@@ -503,7 +514,14 @@ function renderList(runs) {
 
 function runRow(r) {
   const color = statusColor(r.status);
-  const cancellable = ['running', 'pending', 'waiting_for_clarification'].includes(r.status);
+  // Mirrors runDetail.js's cancellable set — this list was missing
+  // 'waiting_for_truncation_retry', so a run halted on a truncation
+  // retry showed the trash/delete icon here (implying a straight
+  // delete) while runDetail.js showed the "Cancel run" affordance for
+  // the exact same status. Keeping the sets identical avoids that
+  // mismatch, though with the toast fix above it no longer matters which
+  // icon renders — either one now reports what the server actually did.
+  const cancellable = ['running', 'pending', 'waiting_for_clarification', 'waiting_for_truncation_retry'].includes(r.status);
   const duration = r.total_latency_ms != null
     ? fmtDuration(r.total_latency_ms / 1000)
     : fmtDuration(runDurationSeconds(r));

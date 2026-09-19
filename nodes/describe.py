@@ -8,6 +8,13 @@ eliminate schema overhead for conversational responses.
 System prompt lives in config/prompts/describe.yaml.
 The raw OpenAI client is used directly; thinking budget from routing.yaml
 is read via _get_thinking_budget("describe").
+
+Web search: describe is also where lookup-style questions land ("search for
+today's date", "what's the latest FastAPI release") — see classify.yaml. When
+state["use_search"] is set, the search_web tool is offered and a small tool
+loop runs before the final answer (same mechanics as clients/llm.py's
+call_model_with_tools, but plain text out instead of a schema). With
+use_search off, this behaves exactly as it did before.
 """
 
 from __future__ import annotations
@@ -23,10 +30,17 @@ from clients.llm import (
     get_model_config, load_prompt, resolve_role, resolve_ultra_model,
     _write_thinking_log, _extract_thinking_partial,
     _log_stage_entry, _get_thinking_budget, _get_http_timeout,
-    _get_output_token_cap, TruncatedOutputError,
+    _get_output_token_cap, TruncatedOutputError, ToolCallRecord,
+)
+from clients.tools import (
+    SEARCH_HINT, SEARCH_TOOL_SCHEMA, TOOL_IMPLEMENTATIONS, format_search_notes,
 )
 
 log = logging.getLogger(__name__)
+
+# Cap on search round-trips before the model is told to answer with what it
+# has (tool_choice="none"). Mirrors call_model_with_tools' default.
+_MAX_TOOL_ROUNDS = 4
 
 
 def _resolve_describe_model(state: dict) -> str:
@@ -136,28 +150,101 @@ def describe_node(state: dict) -> dict:
         base_url=base_url, api_key="local", timeout=_get_http_timeout(), max_retries=0
     )
 
+    # Web search is opt-in per run (state["use_search"]). Offered as a real
+    # tool, and SEARCH_HINT is put in front of the task so the model is told
+    # it can search — a 9B won't reliably call a tool nobody mentioned.
+    call_tools = [SEARCH_TOOL_SCHEMA] if state.get("use_search") else None
+    user_text  = (SEARCH_HINT + task) if call_tools else task
+
     messages = [
         {"role": "system", "content": system_text},
-        {"role": "user",   "content": task},
+        {"role": "user",   "content": user_text},
     ]
+
+    extra_body = {
+        "thinking": {"type": "enabled", "budget_tokens": budget}
+    } if budget > 0 else {
+        "thinking": {"type": "disabled"}
+    }
+
+    working_messages = list(messages)   # grows with tool turns; `messages` stays
+                                        # as system+user for the prompt hash
+    tool_history: list[ToolCallRecord] = []
+    tokens_out_total = 0
+    rounds = 0
 
     start_ts = time.perf_counter()
 
-    resp = raw_client.chat.completions.create(
-        model      = model_id,
-        messages   = messages,
-        temperature= cfg.get("temperature", 0.6),
-        max_tokens = max_tokens,   # None = unbounded, matches prior behaviour
-        extra_body = {
-            "thinking": {"type": "enabled", "budget_tokens": budget}
-        } if budget > 0 else {
-            "thinking": {"type": "disabled"}
-        },
-    )
+    while True:
+        rounds += 1
+        force_final = bool(call_tools) and rounds > _MAX_TOOL_ROUNDS
 
-    raw_content = resp.choices[0].message.content or ""
-    finish_reason = resp.choices[0].finish_reason
-    usage       = resp.usage
+        create_kwargs = dict(
+            model       = model_id,
+            messages    = working_messages,
+            temperature = cfg.get("temperature", 0.6),
+            max_tokens  = max_tokens,   # None = unbounded, matches prior behaviour
+            extra_body  = extra_body,
+        )
+        if call_tools:
+            create_kwargs["tools"]       = call_tools
+            create_kwargs["tool_choice"] = "none" if force_final else "auto"
+
+        resp = raw_client.chat.completions.create(**create_kwargs)
+        msg   = resp.choices[0].message
+        usage = resp.usage
+        if usage:
+            tokens_out_total += usage.completion_tokens
+
+        # llama.cpp puts thinking on tool-calling responses in a separate
+        # reasoning_content field rather than <think> tags in content (see
+        # call_model_with_tools' docstring) — log it per round.
+        reasoning = getattr(msg, "reasoning_content", None) or ""
+        if reasoning:
+            _write_thinking_log(run_dir, "describe", reasoning)
+
+        if call_tools and msg.tool_calls and not force_final:
+            log.info("[describe] round %d: model requested %d tool call(s)",
+                     rounds, len(msg.tool_calls))
+            working_messages.append(msg.model_dump(exclude_none=True))
+            for tc in msg.tool_calls:
+                tool_name = tc.function.name
+                try:
+                    tool_args = json.loads(tc.function.arguments or "{}")
+                except json.JSONDecodeError as e:
+                    log.warning("[describe] tool call %s had unparseable arguments (%s): %r",
+                                tool_name, e, tc.function.arguments)
+                    tool_args = {}
+
+                impl = TOOL_IMPLEMENTATIONS.get(tool_name)
+                if impl is None:
+                    result_text = f"Error: unknown tool '{tool_name}'."
+                    log.warning("[describe] model called unregistered tool '%s'", tool_name)
+                else:
+                    try:
+                        result_text = impl(tool_args)
+                    except Exception as e:
+                        # Best-effort, same as call_model_with_tools: hand
+                        # the error back as the tool result so the model can
+                        # answer without it instead of crashing the node.
+                        log.warning("[describe] tool '%s' raised: %s", tool_name, e)
+                        result_text = f"Error running tool: {e}"
+
+                tool_history.append(ToolCallRecord(
+                    name=tool_name, arguments=tool_args, result=result_text,
+                ))
+                working_messages.append({
+                    "role":         "tool",
+                    "tool_call_id": tc.id,
+                    "content":      result_text,
+                })
+            continue   # go again with the tool results in context
+
+        # No tool calls (or a forced final answer) — this is the answer.
+        raw_content   = msg.content or ""
+        finish_reason = resp.choices[0].finish_reason
+        break
+
     elapsed_ms  = (time.perf_counter() - start_ts) * 1000
     truncated   = finish_reason == "length"
 
@@ -178,7 +265,7 @@ def describe_node(state: dict) -> dict:
     _log_stage_entry(
         run_dir, "describe", cfg["name"], prompt_hash,
         usage.prompt_tokens     if usage else 0,
-        usage.completion_tokens if usage else 0,
+        tokens_out_total,
         elapsed_ms, "truncated" if truncated else "ok", 0,
     )
 
@@ -220,7 +307,8 @@ def describe_node(state: dict) -> dict:
             partial_answer=answer,
         )
 
-    log.info("[describe] answered in %.0fms", elapsed_ms)
+    log.info("[describe] answered in %.0fms (%d tool round(s), %d search call(s))",
+             elapsed_ms, rounds, len(tool_history))
 
     output_path = str(Path(run_dir) / "final.json")
     Path(output_path).write_text(
@@ -232,6 +320,9 @@ def describe_node(state: dict) -> dict:
         "final_output_path": output_path,
         "pipeline_complete": True,
         "pipeline_failed":   False,
+        # Overwritten every pass ("" when nothing was searched) so a chat
+        # follow-up on a reused checkpoint can't show a previous turn's results.
+        "search_notes":      format_search_notes(tool_history),
     }
     if "escalated_models" in state:
         result["escalated_models"] = state["escalated_models"]

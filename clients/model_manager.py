@@ -14,6 +14,7 @@ Key design decisions:
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import signal
@@ -95,6 +96,22 @@ def ensure_model_loaded(model_id: str) -> bool:
         _stop_current()
         if old_port:
             _wait_for_port_death(old_port)
+        # Bug found via a crash: _stop_current()'s own proc.wait(timeout=20)
+        # confirms the OLD PROCESS exited, and _wait_for_port_death above
+        # confirms its PORT stopped responding — but on WSL2 (and some
+        # native Linux setups under memory pressure), the host reclaiming
+        # a just-exited process's mlock'd pages is a SEPARATE, sometimes
+        # slower event than the process itself exiting. A crash was traced
+        # to exactly this gap: 9B (~9GB resident) was stopped and its port
+        # confirmed dead, but the very next model's mlock() of a ~20GB
+        # buffer failed with "Cannot allocate memory" because the host
+        # hadn't finished reclaiming the prior process's memory yet — and
+        # a failed mlock into a not-yet-reclaimed region during active
+        # memory pressure is exactly the kind of event that can bring down
+        # the whole WSL VM, not just this Python process. Actively wait
+        # for available memory to recover before attempting the new load,
+        # rather than assuming port-death implies memory-reclaimed.
+        _wait_for_memory_available(model_id)
     else:
         log.info("Loading model: %s", model_id)
 
@@ -110,6 +127,196 @@ def _wait_for_port_death(port: int, timeout: int = 10) -> None:
             return
         time.sleep(0.1)
     log.warning("Port %d did not die within %ds, continuing anyway...", port, timeout)
+
+
+# Rough resident-memory footprint per model — used ONLY as a fallback for
+# a model's very FIRST load, before any measured data exists (see
+# _measured_model_ram_gb below, which is what's actually used once a
+# model has loaded at least once). Deliberately generous (rounds up)
+# since under-waiting is what caused the crash this guards against.
+# These are ballpark figures from the quant sizes in config/models.yaml,
+# NOT measured — expect them to be somewhat off; the measured path is
+# the accurate one; this table only covers the cold-start gap before any
+# measurement exists.
+_APPROX_MODEL_RAM_GB = {
+    "9b":         8,
+    "27b":        11,
+    "27b_ultra":  18,
+    "35b":        22,
+    "deepcoder":  10,
+}
+
+# Where measured footprints are cached across process restarts — a
+# fresh Python process has no memory of a prior run's measurements
+# otherwise, and re-measuring requires the model to already be loaded
+# once, which is exactly the chicken-and-egg this cache avoids repeating
+# every restart.
+_MEMORY_CACHE_PATH = Path(__file__).parent.parent / "logs" / "_model_ram_measured.json"
+
+
+def _measured_model_ram_gb(model_id: str) -> Optional[float]:
+    """Return this model's actual measured RAM footprint in GB, or None if
+    it's never been successfully measured (falls back to the static
+    _APPROX_MODEL_RAM_GB table in that case — see _wait_for_memory_available)."""
+    try:
+        cache = json.loads(_MEMORY_CACHE_PATH.read_text())
+        return cache.get(model_id)
+    except Exception:
+        return None
+
+
+def _record_measured_model_ram(model_id: str, log_file: Path) -> None:
+    """
+    Parse model_id's own just-written server log for its ACTUAL resident
+    footprint and cache it, so future loads use a real measurement
+    instead of the _APPROX_MODEL_RAM_GB guess.
+
+    llama.cpp logs one "... model buffer size = <N> MiB" line per memory
+    region it allocated — how many lines and which labels (CUDA0,
+    CPU_Mapped, "CPU model buffer size", etc.) appear depends on the
+    model's own offload split (see config/models.yaml's partial_offload
+    for 27b_ultra, for instance, which deliberately splits across GPU and
+    pinned system RAM). Sum ALL such lines from the model's startup block
+    — that total is the actual host-memory commitment this function cares
+    about, regardless of the GPU/CPU split within it (a value in "CUDA0
+    model buffer size" is still memory the host had to make available,
+    whether or not it ends up mapped to the GPU device).
+
+    Only reads the LAST such contiguous block in the file (this model's
+    most recent startup), same convention clients/model_memory.py already
+    uses elsewhere for this log format, per model_manager.py's own
+    docstring reference to it — this function doesn't import that module
+    (wasn't available to check its exact interface against), but follows
+    the same "read the last load block" rule so the two don't disagree
+    about which numbers in a multi-restart log file are current.
+    """
+    try:
+        text = log_file.read_text(errors="replace")
+    except Exception as e:
+        log.debug("Could not read %s to measure RAM for '%s': %s", log_file, model_id, e)
+        return
+
+    import re
+    pattern = re.compile(r"model buffer size\s*=\s*([\d.]+)\s*MiB")
+    matches = pattern.findall(text)
+    if not matches:
+        log.debug("No 'model buffer size' lines found in %s for '%s' — can't measure", log_file, model_id)
+        return
+
+    # "Last load block": take the tail run of matches. Since a fresh
+    # ensure_model_loaded() call always writes to a log file that was
+    # opened with "a" (append) in _load_model, an OLDER run's lines can
+    # still be present above this run's. Rather than parse timestamps,
+    # take the last N lines where N is however many buffer-size lines
+    # this SAME load produced consecutively at the end of the file — in
+    # practice llama.cpp emits all of one load's buffer lines together
+    # with nothing but other load_tensors lines between them, so summing
+    # every match in the file would double-count prior loads. Taking only
+    # matches from the final contiguous group (no more than a handful of
+    # non-matching lines between them) is a reasonable middle ground
+    # without needing to also parse timestamps or restart markers.
+    lines = text.splitlines()
+    total_mib = 0.0
+    found_any = False
+    miss_streak = 0
+    for line in reversed(lines):
+        m = pattern.search(line)
+        if m:
+            total_mib += float(m.group(1))
+            found_any = True
+            miss_streak = 0
+        else:
+            miss_streak += 1
+            if found_any and miss_streak > 5:
+                break   # ran past this load's contiguous buffer-size block
+
+    if not found_any or total_mib <= 0:
+        return
+
+    total_gb = total_mib / 1024.0
+    try:
+        cache = {}
+        if _MEMORY_CACHE_PATH.exists():
+            cache = json.loads(_MEMORY_CACHE_PATH.read_text())
+        cache[model_id] = round(total_gb, 2)
+        _MEMORY_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _MEMORY_CACHE_PATH.write_text(json.dumps(cache, indent=2))
+        log.info("Measured '%s' resident footprint: %.2f GB (cached for future loads)", model_id, total_gb)
+    except Exception as e:
+        log.warning("Could not cache measured RAM for '%s': %s", model_id, e)
+
+
+def _wait_for_memory_available(
+    incoming_model_id: str, timeout: int = 30, poll_interval: float = 0.5,
+) -> None:
+    """
+    Poll available system memory until there's enough headroom for
+    incoming_model_id's footprint, or timeout elapses.
+
+    Prefers a MEASURED footprint (from this model's own prior load — see
+    _measured_model_ram_gb/_record_measured_model_ram) over the static
+    _APPROX_MODEL_RAM_GB guess table, which only covers the first-ever
+    load of a given model before any measurement exists. The static
+    table is a rough estimate and may be meaningfully off (it wasn't
+    tuned against real logs) — the measured path is the accurate one and
+    is what you should expect to be used for anything beyond a model's
+    very first load in this project.
+
+    Adds a 10% safety margin on top of whichever figure is used, since
+    both the static guess and a single measurement are point estimates,
+    not guarantees — llama.cpp's own reported buffer sizes don't include
+    every allocation (context/KV cache scales with n_ctx, for instance),
+    so treat this as "wait for at least the model weights' worth of
+    headroom", not "wait for the exact total the process will ever use".
+
+    Best-effort: if psutil isn't installed, or no size estimate exists
+    for this model at all (neither measured nor in the static table),
+    falls back to a fixed sleep. Logs a warning rather than raising
+    either way — a timeout here means "proceed anyway and let the load
+    itself fail/succeed on its own merits", not "block the pipeline
+    indefinitely on a machine that's just genuinely tight on RAM".
+    """
+    measured_gb = _measured_model_ram_gb(incoming_model_id)
+    needed_gb   = measured_gb if measured_gb is not None else _APPROX_MODEL_RAM_GB.get(incoming_model_id)
+    source      = "measured" if measured_gb is not None else "estimated"
+
+    try:
+        import psutil
+    except ImportError:
+        log.warning(
+            "psutil not available — falling back to a fixed 3s delay before "
+            "loading %s. Install psutil for an active memory-availability "
+            "check instead (see api/server.py's own psutil dependency).",
+            incoming_model_id,
+        )
+        time.sleep(3.0)
+        return
+
+    if needed_gb is None:
+        log.debug("No RAM estimate for model '%s' — using a fixed 3s delay", incoming_model_id)
+        time.sleep(3.0)
+        return
+
+    needed_bytes = needed_gb * 1.10 * (1024 ** 3)   # +10% safety margin — see docstring
+    start = time.perf_counter()
+    while time.perf_counter() - start < timeout:
+        available = psutil.virtual_memory().available
+        if available >= needed_bytes:
+            log.debug(
+                "Memory check: %.1fGB available >= %.1fGB needed (%s, +10%%) for '%s' — proceeding",
+                available / (1024 ** 3), needed_bytes / (1024 ** 3), source, incoming_model_id,
+            )
+            return
+        time.sleep(poll_interval)
+
+    log.warning(
+        "Only %.1fGB available after %ds waiting for %.1fGB needed (%s) by '%s' — "
+        "proceeding anyway (load may fail or the system may come under "
+        "memory pressure; consider closing other applications, raising "
+        "your .wslconfig memory= limit, or lowering this model's "
+        "partial_offload settings in config/models.yaml).",
+        psutil.virtual_memory().available / (1024 ** 3), timeout, needed_gb, source, incoming_model_id,
+    )
 
 
 def stop_all() -> None:
@@ -200,6 +407,18 @@ def _load_model(model_id: str) -> None:
     _current_model = model_id
     log.info("%s ready on port %d", model_cfg["name"], port)
 
+    # Measure this model's actual resident footprint from its own
+    # just-written log now that health confirms it's genuinely loaded
+    # (not just spawned) — see _record_measured_model_ram's docstring.
+    # Best-effort: a failure here shouldn't affect the model actually
+    # being ready to use, only whether future loads get the accurate
+    # (measured) memory-wait figure or fall back to the rougher static
+    # estimate.
+    try:
+        _record_measured_model_ram(model_id, log_file)
+    except Exception as e:
+        log.warning("Could not measure RAM footprint for '%s': %s", model_id, e)
+
 
 def _stop_current() -> None:
     """
@@ -280,42 +499,49 @@ def _kill_port(port: int) -> None:
         log.warning("_kill_port lsof error: %s", e)
 
 
-def _wait_for_health(
-    port:    int,
-    name:    str,
-    proc:    subprocess.Popen,
-    timeout: int = 300,
-) -> None:
-    """Poll health endpoint until the server responds or times out."""
-    url      = f"http://localhost:{port}/health"
-    elapsed  = 0
+# In _wait_for_health, after getting a 200 from /health, don't return
+# immediately — confirm the server actually accepts a real request.
+# /health reporting healthy and the server being ready to serve
+# /v1/chat/completions without dropping the connection are not
+# guaranteed to be the same moment for every llama.cpp version —
+# this closes that gap the same way _wait_for_memory_available closed
+# the memory-reclaim gap on the stop side.
+def _wait_for_health(port, name, proc, timeout=300):
+    url = f"http://localhost:{port}/health"
+    elapsed = 0
     interval = 3
-
     log.info("Waiting for %s to load (timeout: %ds)...", name, timeout)
-
     while elapsed < timeout:
-        # Check if the process died before the server came up
         if proc.poll() is not None:
-            raise RuntimeError(
-                f"{name} process exited (code {proc.returncode}) before "
-                f"becoming healthy. Check logs/{name.lower().replace(' ', '_')}_server.log"
-            )
-
+            raise RuntimeError(f"{name} process exited (code {proc.returncode}) before becoming healthy.")
         try:
             with urllib.request.urlopen(url, timeout=2) as resp:
                 if resp.status == 200:
-                    log.info("%s loaded in %ds", name, elapsed)
-                    return
+                    # Confirm readiness with a trivial real completion,
+                    # not just /health — see comment above.
+                    if _confirm_completion_ready(port):
+                        log.info("%s loaded in %ds", name, elapsed)
+                        return
         except Exception:
             pass
-
         time.sleep(interval)
         elapsed += interval
+    raise TimeoutError(f"{name} did not become healthy within {timeout}s.")
 
-        if elapsed % 30 == 0:
-            log.info("Still waiting for %s... (%ds elapsed)", name, elapsed)
-
-    raise TimeoutError(
-        f"{name} did not become healthy within {timeout}s. "
-        f"Check logs/ for errors."
-    )
+def _confirm_completion_ready(port: int) -> bool:
+    """One tiny real completion request, not just /health, to confirm
+    the server will actually accept inference calls before we report
+    ready and let a pipeline stage race it."""
+    try:
+        req = urllib.request.Request(
+            f"http://localhost:{port}/v1/chat/completions",
+            data=json.dumps({
+                "model": "x", "messages": [{"role": "user", "content": "hi"}],
+                "max_tokens": 1,
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return resp.status == 200
+    except Exception:
+        return False

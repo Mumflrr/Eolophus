@@ -1,0 +1,13 @@
+[tool.vulture]
+# 1. Target Scope
+paths = ["api","clients","config","nodes","pipeline","schemas","servers","storage","tools"]
+exclude = ["test/","logs", "runs"]
+
+# 2. Strictness & Metrics
+min_confidence = 70
+sort_by_size = true
+verbose = false
+
+# 3. Dynamic Bypasses
+ignore_decorators = []
+ignore_names = []

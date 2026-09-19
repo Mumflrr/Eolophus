@@ -44,6 +44,15 @@ class PipelineState(TypedDict, total=False):
     # why undeclared top-level keys don't survive. plan_node/ideation_node
     # should check this and call clients.search.search_web() when true.
     use_search:         bool
+    # Web-search results the planning stage gathered via the search_web tool
+    # (query + returned snippets, plain text), or "" if search was enabled
+    # but the model never called it. Overwritten by plan_node on EVERY plan
+    # pass (including chat follow-up turns, which reuse the run's checkpoint
+    # thread) so a stale earlier answer's results can't leak into a later
+    # turn. Read by drafter.py so the model that actually writes the reply
+    # sees what was found. Declared here because LangGraph silently drops
+    # undeclared top-level keys — see the custom_step_outputs note below.
+    search_notes:       Optional[str]
 
     # ── Pipeline profile & escalation ─────────────────────────────────────────
     # profile: the resolved pipeline_profiles (routing.yaml) name for this

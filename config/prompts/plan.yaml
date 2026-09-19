@@ -1,4 +1,4 @@
-version: "1.1"
+version: "1.2"
 role: plan
 model: 9b
 thinking: true
@@ -45,6 +45,6 @@ system: |
   unsubscribe/publish/clear, threading.Lock, exception isolation)."
 
 user_template: |
-  {lessons_block}Task:
+  {search_hint}{lessons_block}Task:
   {task}
   {ideation_block}{correction_block}{chat_block}

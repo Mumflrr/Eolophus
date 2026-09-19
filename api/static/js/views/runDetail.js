@@ -28,6 +28,23 @@ import { setUltraAmbient } from '../ambient.js';
 // and chat replies actually tend to use (paragraphs, emphasis, inline
 // and fenced code, links, simple lists, headers) without the complexity
 // (and larger escaping surface) of a full CommonMark implementation.
+// Base64-encodes a UTF-8 string for safe embedding in an HTML attribute.
+// Used to carry each code block's own raw (unescaped, unrendered) source
+// on itself via a data- attribute, so the per-block copy button (see
+// renderMarkdown below and its click wiring in renderChat) can read the
+// exact original text back out without re-parsing rendered HTML — which
+// would otherwise risk subtly mismatched whitespace/entities on copy.
+// btoa() only handles Latin1, so the string is UTF-8-encoded first via
+// encodeURIComponent/unescape, the same standard workaround used
+// elsewhere for btoa + non-ASCII content.
+function _b64EncodeUtf8(str) {
+  try {
+    return btoa(unescape(encodeURIComponent(str)));
+  } catch {
+    return '';
+  }
+}
+
 function renderMarkdown(raw) {
   if (!raw) return '';
 
@@ -35,10 +52,23 @@ function renderMarkdown(raw) {
   // their content must NOT have inline markdown (bold/italic/links)
   // applied inside it, and doing this before escaping the rest avoids
   // double-escaping the code itself.
+  //
+  // Each block carries its own raw source as a base64 data attribute
+  // (data-raw-code-b64) so the per-block copy button can copy the exact
+  // original text — see the [data-code-copy] click handler in renderChat.
+  // This avoids changing renderMarkdown's return type (still a plain
+  // string), so the other two call sites need no changes.
   const codeBlocks = [];
   let text = String(raw).replace(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
     const idx = codeBlocks.length;
-    codeBlocks.push(`<pre class="chat-code-block"><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${escapeHtml(code.replace(/\n$/, ''))}</code></pre>`);
+    const cleanCode = code.replace(/\n$/, '');
+    const rawB64 = _b64EncodeUtf8(cleanCode);
+    codeBlocks.push(
+      `<div class="chat-code-block-wrap">` +
+        `<button type="button" class="btn-icon chat-code-copy-btn" data-code-copy-b64="${rawB64}" title="Copy code">⧉</button>` +
+        `<pre class="chat-code-block"><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${escapeHtml(cleanCode)}</code></pre>` +
+      `</div>`
+    );
     return `\u0000CODEBLOCK${idx}\u0000`;
   });
 
@@ -141,7 +171,7 @@ async function copyToClipboard(text, btn) {
 let root = null;
 let es = null;
 let runUuid = null;
-let data = { status: null, stages: [], artifacts: {}, iterations: {}, chatArtifacts: {}, turnIterations: {}, clarification: null, truncation: null, mode: null, profile: null };
+let data = { status: null, stages: [], artifacts: {}, iterations: {}, chatArtifacts: {}, turnIterations: {}, clarification: null, truncation: null, mode: null, profile: null, lastAnsweredQuestion: null };
 let clarifySubmitting = false;
 let truncationRetrySubmitting = false;
 let attachmentActionPending = null; // filename currently being excluded/included, or null
@@ -242,7 +272,7 @@ const NODE_ARTIFACT_KEY = {
 export function mount(el, { runUuid: uuid }) {
   root = el;
   runUuid = uuid;
-  data = { status: null, stages: [], artifacts: {}, iterations: {}, chatArtifacts: {}, turnIterations: {}, clarification: null, truncation: null, mode: null, profile: null };
+  data = { status: null, stages: [], artifacts: {}, iterations: {}, chatArtifacts: {}, turnIterations: {}, clarification: null, truncation: null, mode: null, profile: null, lastAnsweredQuestion: null };
   chat = { messages: [], loaded: false };
   drawerExpanded = false;
   chatSending = false;
@@ -383,7 +413,27 @@ function applyRunDetail(r) {
   // isn't "still waiting for clarification" — at that point any FUTURE
   // clarification (a later turn in the same chat) is a new, real one and
   // should display normally again.
-  if (data.justAnsweredClarification && r.status === 'waiting_for_clarification') {
+  //
+  // Refinement: the original guard cleared on ANY non-waiting status,
+  // which meant a slow resume thread (bugfix/audit/validate can each run
+  // minutes — see clarify.py's resume_sentinel_dir comment) could let the
+  // guard lapse before the server had genuinely moved past the OLD
+  // clarification, and a fast re-clarify round (or a stale
+  // clarification.json read that hadn't been deleted yet at the exact
+  // instant this particular request hit the server) would make the same
+  // question flash back up. lastAnsweredQuestion narrows the guard: a
+  // reappearance of the EXACT question just answered is always treated
+  // as the stale read it almost certainly is, while a genuinely NEW
+  // question (different text) is trusted immediately even if the guard
+  // flag is technically still set — so a fast back-to-back clarify round
+  // on a different question is never hidden.
+  const incomingQuestion = r.clarification && r.clarification.question;
+  const isStaleSameQuestion =
+    data.justAnsweredClarification &&
+    r.status === 'waiting_for_clarification' &&
+    (!incomingQuestion || incomingQuestion === data.lastAnsweredQuestion);
+
+  if (isStaleSameQuestion) {
     // Stale read — server hasn't caught up yet. Keep showing "answered".
     data.clarification = null;
   } else {
@@ -431,6 +481,22 @@ function openStream() {
     try { payload = JSON.parse(evt.data); } catch { return; }
 
     if (payload.type === 'clarification') {
+      // The stream replays its full history from the start on every
+      // (re)connection — see the data.stages reset above — and
+      // openStream() reconnects after EVERY clarify submit and EVERY
+      // chat send. Without a guard, that replay includes the ORIGINAL
+      // 'clarification' event for a question already answered, and this
+      // handler believed it as a brand-new halt every time: hence the
+      // box reappearing right after being answered (the very next
+      // reconnect replays it) and then persisting through every later,
+      // unrelated chat turn (each one reconnects and replays it again).
+      // applyRunDetail() already solves this exact problem for GET /run
+      // responses via justAnsweredClarification/lastAnsweredQuestion —
+      // apply the same check here instead of trusting the raw event.
+      if (payload.question === data.lastAnsweredQuestion) {
+        return;
+      }
+      data.justAnsweredClarification = false;
       data.status = 'waiting_for_clarification';
       data.clarification = { question: payload.question };
       renderStatusBadge();
@@ -661,10 +727,12 @@ function renderChatProfilePicker() {
   });
 }
 
-// Scrolling up while over the (collapsed) drawer expands it; scrolling
-// down while already at the top of the expanded, fully-scrolled-up
-// drawer collapses it back. Once expanded, normal scroll behavior inside
-// the body takes over for paging through history.
+// Scrolling down while over the (collapsed) drawer expands it — the
+// conventional direction for a bottom-anchored panel, where scrolling
+// toward it reveals more; scrolling up while already at the top of the
+// expanded, fully-scrolled-up drawer collapses it back. Once expanded,
+// normal scroll behavior inside the body takes over for paging through
+// history.
 //
 // A single trackpad/wheel gesture fires many onwheel events in quick
 // succession. Without a guard, each one re-set drawerExpanded and called
@@ -684,20 +752,20 @@ function beginDrawerTransition() {
   setTimeout(() => { drawerTransitioning = false; }, DRAWER_TRANSITION_MS);
 }
 
-// Scrolling up while over the (collapsed) drawer expands it; scrolling
-// down while already at the top of the expanded, fully-scrolled-up
-// drawer collapses it back. Once expanded, normal scroll behavior inside
-// the body takes over for paging through history.
+// Scrolling down while over the (collapsed) drawer expands it; scrolling
+// up while already at the top of the expanded, fully-scrolled-up drawer
+// collapses it back. Once expanded, normal scroll behavior inside the
+// body takes over for paging through history.
 //
 // Bug this guards against: scrollTop is 0 both (a) right after expanding,
 // before the user has scrolled at all, and (b) after the user has
 // scrolled down through history and back up to the top. Those two cases
-// look identical to a "scrollTop <= 0" check, so the very first downward
+// look identical to a "scrollTop <= 0" check, so the very first upward
 // wheel tick right after expanding was being read as "at top, scrolling
-// down => collapse", collapsing the drawer before the user could ever
-// move scrollTop off zero. drawerJustExpandedAt tracks a short settle
-// window right after expansion during which downward scrolling is always
-// treated as normal scrolling, never as a collapse trigger.
+// up => collapse", collapsing the drawer before the user could ever move
+// scrollTop off zero. drawerJustExpandedAt tracks a short settle window
+// right after expansion during which upward scrolling is always treated
+// as normal scrolling, never as a collapse trigger.
 let drawerJustExpandedAt = 0;
 const DRAWER_SETTLE_MS = 500;
 
@@ -716,7 +784,10 @@ function onDrawerWheel(e) {
 
   if (drawerTransitioning) return;
 
-  if (!drawerExpanded && e.deltaY < 0) {
+  // Scrolling DOWN while collapsed expands — matches the intuitive
+  // direction for a bottom-anchored drawer (scroll toward it to reveal
+  // more), flipped from the original "natural scroll" mapping.
+  if (!drawerExpanded && e.deltaY > 0) {
     drawerExpanded = true;
     drawerJustExpandedAt = performance.now();
     beginDrawerTransition();
@@ -724,8 +795,10 @@ function onDrawerWheel(e) {
     return;
   }
 
+  // Scrolling UP while already at the top of the expanded, fully-
+  // scrolled-up drawer collapses it back.
   const justExpanded = performance.now() - drawerJustExpandedAt < DRAWER_SETTLE_MS;
-  if (drawerExpanded && e.deltaY > 0 && body.scrollTop <= 0 && !justExpanded) {
+  if (drawerExpanded && e.deltaY < 0 && body.scrollTop <= 0 && !justExpanded) {
     drawerExpanded = false;
     beginDrawerTransition();
     renderChat();
@@ -775,7 +848,29 @@ function renderTimeline() {
   }
 
   const isRunning = data.status === 'running' || data.status === 'pending';
-  const nodes = data.stages.map((s, i) => stageNode(s, data.stages[i - 1], i === data.stages.length - 1 && !isRunning));
+
+  // Precompute an effective memory reading for every stage, not just the
+  // rare one that actually triggered a load (see llm.py's did_load
+  // check — most stages have no memory_mib of their own at all). Carry
+  // forward the last reading taken for whichever model this stage
+  // actually used, so the size badge shows on every stage that model is
+  // active for, not only its load moment. Keyed by model name (not a
+  // single running "last seen" value) so a flash-swap to a DIFFERENT
+  // model doesn't keep showing the previous model's numbers on stages
+  // that switched away from it.
+  const lastMemoryByModel = {};
+  const effectiveMemory = data.stages.map((s) => {
+    if (s.memory_mib) {
+      lastMemoryByModel[s.model] = s.memory_mib;
+      return { mem: s.memory_mib, carried: false };
+    }
+    const carried = s.model && lastMemoryByModel[s.model];
+    return carried ? { mem: carried, carried: true } : { mem: null, carried: false };
+  });
+
+  const nodes = data.stages.map((s, i) => stageNode(
+    s, data.stages[i - 1], i === data.stages.length - 1 && !isRunning, effectiveMemory[i],
+  ));
 
   let trailing = '';
   if (isRunning) {
@@ -794,37 +889,50 @@ function renderTimeline() {
   mount_.innerHTML = runTotalsSummary() + nodes.join('') + trailing;
 }
 
+// MiB/GiB formatter shared by runTotalsSummary() and stageNode() — both
+// need identical formatting for the same memory_mib fields, and having
+// it in two slightly-different inline copies (as it was before the RAM
+// split) is exactly how they'd quietly drift apart later.
+function fmtMib(mib) {
+  return mib >= 1024 ? `${(mib / 1024).toFixed(2)} GiB` : `${Math.round(mib)} MiB`;
+}
+
 // Sums tokens_in/tokens_out across every stage entry, and separately
-// finds the largest single memory_mib.gpu_total seen (not a sum — each
-// entry is a snapshot of ONE model's footprint at its own load moment,
-// and those models are flash-swapped in and out of the same 10GB card
-// one at a time per model_manager.py's EXCLUSIVE_MODELS/_stop_current,
-// never resident simultaneously, so adding them together would imply
-// concurrent usage that never actually happens; the peak single load is
-// the number worth knowing).
+// finds the largest single memory_mib.gpu_total / .host_total seen (not
+// a sum — each entry is a snapshot of ONE model's footprint at its own
+// load moment, and those models are flash-swapped in and out of the
+// same 10GB card one at a time per model_manager.py's
+// EXCLUSIVE_MODELS/_stop_current, never resident simultaneously, so
+// adding them together would imply concurrent usage that never actually
+// happens; the peak single load is the number worth knowing). Tracked
+// separately for VRAM (gpu_total) and RAM (host_total) — see
+// llm.py's _log_stage_entry, which already writes both onto every
+// memory_mib it attaches; only gpu_total was ever read here before.
 function runTotalsSummary() {
-  let tokensIn = 0, tokensOut = 0, peakGpuMib = null;
+  let tokensIn = 0, tokensOut = 0, peakGpuMib = null, peakHostMib = null;
   for (const s of data.stages) {
     tokensIn  += s.tokens_in  || 0;
     tokensOut += s.tokens_out || 0;
     const g = s.memory_mib && s.memory_mib.gpu_total;
-    if (g != null && (peakGpuMib === null || g > peakGpuMib)) peakGpuMib = g;
+    const h = s.memory_mib && s.memory_mib.host_total;
+    if (g != null && (peakGpuMib  === null || g > peakGpuMib))  peakGpuMib  = g;
+    if (h != null && (peakHostMib === null || h > peakHostMib)) peakHostMib = h;
   }
-  if (!tokensIn && !tokensOut && peakGpuMib === null) return '';
+  if (!tokensIn && !tokensOut && peakGpuMib === null && peakHostMib === null) return '';
 
-  const peakLabel = peakGpuMib === null
-    ? null
-    : (peakGpuMib >= 1024 ? `${(peakGpuMib / 1024).toFixed(2)} GiB` : `${Math.round(peakGpuMib)} MiB`);
+  const peakGpuLabel  = peakGpuMib  === null ? null : fmtMib(peakGpuMib);
+  const peakHostLabel = peakHostMib === null ? null : fmtMib(peakHostMib);
 
   return `
     <div class="run-totals-summary">
       <span class="meta-item"><strong>${fmtNumber(tokensIn)}</strong> in / <strong>${fmtNumber(tokensOut)}</strong> out total</span>
-      ${peakLabel ? `<span class="meta-item" title="Largest single model load seen this run (models are flash-swapped, not concurrent — see runDetail.js comment)">peak ${peakLabel}</span>` : ''}
+      ${peakGpuLabel  ? `<span class="meta-item" title="Largest single model's VRAM footprint seen this run (models are flash-swapped, not concurrent — see runDetail.js comment)">peak ${peakGpuLabel} VRAM</span>` : ''}
+      ${peakHostLabel ? `<span class="meta-item" title="Largest single model's host RAM footprint seen this run">peak ${peakHostLabel} RAM</span>` : ''}
     </div>
   `;
 }
 
-function stageNode(s, prev, isLast) {
+function stageNode(s, prev, isLast, effMem) {
   const isSwapEntry   = s.stage === 'model_swap';
   // Synthetic marker written by POST /clarify right when a clarification
   // round resumes — see server.py's clarify_run. Distinguishes "3 classify
@@ -871,19 +979,29 @@ function stageNode(s, prev, isLast) {
   const retryBadge = s.retries > 0 ? `<span class="badge orange">${s.retries} retr${s.retries === 1 ? 'y' : 'ies'}</span>` : '';
   const statusBadge = (s.status && s.status !== 'ok') ? `<span class="badge red">${escapeHtml(s.status)}</span>` : '';
 
-  // memory_mib is only present on the (rare) stage entry where a model
-  // load actually just happened — see llm.py's did_load check. Most
-  // stages have no memory_mib at all, which is correct: it's a load
-  // event, not a per-call measurement. gpu_total may itself be null even
-  // when memory_mib is present, if -lv 4 wasn't set for that model's
-  // launch script (see model_memory.py's docstring) — guard both levels.
+  // memory_mib is only DIRECTLY present on the (rare) stage entry where a
+  // model load actually just happened — see llm.py's did_load check.
+  // Most stages have no memory_mib of their own, which is correct: it's
+  // a load event, not a per-call measurement. effMem (from
+  // renderTimeline's carry-forward pass) fills that gap by attaching
+  // whichever reading was last taken for THIS stage's model, so the
+  // badge still shows here even though this particular call didn't
+  // trigger a load; effMem.carried marks that case for the tooltip.
+  // gpu_total/host_total may each individually be null even when
+  // memory_mib is present, if -lv 4 wasn't set for that model's launch
+  // script (see model_memory.py's docstring) — guard both levels.
   //
-  // NOTE: formatted inline (not via a fmtMib()-style helper) because
-  // format.js's actual exports weren't available to check against when
-  // this was written — confirm whether format.js already has a
-  // MiB/GiB-aware formatter and swap this for that if so, rather than
-  // this being a second, slightly-different formatting convention living
-  // alongside it. Same reasoning for not using icon('cpu') here — that
+  // Two separate figures now (VRAM via gpu_total, RAM via host_total) —
+  // llm.py's _log_stage_entry already writes both onto every memory_mib
+  // it attaches (model_memory.ModelMemoryUsage.host_total_mib sums the
+  // CPU_Mapped weights + CUDA_Host compute buffers), this just wasn't
+  // reading host_total before.
+  //
+  // NOTE: shares fmtMib() (defined above runTotalsSummary) rather than
+  // its own inline formatting, now that both need identical treatment
+  // for both fields — see runTotalsSummary's comment for why a second,
+  // slightly-different copy of this logic isn't worth keeping around.
+  // Same reasoning as before for not using icon('cpu') here — that
   // key's existence in icons.js wasn't verified, and a wrong key could
   // silently render nothing depending on how icon() handles misses.
   // .stage-escalation needs a CSS rule added wherever .stage-swap's own
@@ -909,13 +1027,17 @@ function stageNode(s, prev, isLast) {
   // (.stage-swap's own rule — whatever file it's in — likely has its own
   // icon/spacing conventions worth matching too; this is a starting point,
   // not a replacement for checking that file once it's available.)
-  const gpuMib = s.memory_mib && s.memory_mib.gpu_total;
-  const memoryLabel = gpuMib
-    ? (gpuMib >= 1024 ? `${(gpuMib / 1024).toFixed(2)} GiB` : `${Math.round(gpuMib)} MiB`)
-    : null;
-  const memoryBadge = memoryLabel
-    ? `<span class="meta-item" title="GPU memory allocated for this model load">${memoryLabel} loaded</span>`
+  const memInfo   = effMem && effMem.mem;
+  const gpuMib    = memInfo && memInfo.gpu_total;
+  const hostMib   = memInfo && memInfo.host_total;
+  const carriedTip = effMem && effMem.carried ? ' (from this model\'s last load, not remeasured here)' : '';
+  const vramBadge = gpuMib != null
+    ? `<span class="meta-item" title="VRAM this model occupies${carriedTip}">${fmtMib(gpuMib)} VRAM</span>`
     : '';
+  const ramBadge = hostMib != null
+    ? `<span class="meta-item" title="Host RAM this model occupies${carriedTip}">${fmtMib(hostMib)} RAM</span>`
+    : '';
+  const memoryBadge = vramBadge + ramBadge;
 
   return `
     <div class="stage-node">
@@ -1190,6 +1312,7 @@ async function onClarifySubmit(e) {
   try {
     await clarifyRun(runUuid, answer);
     data.status = 'running';
+    data.lastAnsweredQuestion = data.clarification && data.clarification.question;
     data.clarification = null;
     data.justAnsweredClarification = true;
     toastSuccess('Answer sent — run resumed.');
@@ -1367,6 +1490,21 @@ function renderChat() {
         if (msg) copyToClipboard(msg.content, btn);
       });
     });
+    // Per-code-block copy buttons (see renderMarkdown) — each button
+    // carries its own block's raw source as base64 in data-code-copy-b64,
+    // so no lookup against message content/seq is needed here at all.
+    body.querySelectorAll('[data-code-copy-b64]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation(); // don't also trigger the card's expand/collapse
+        let code = '';
+        try {
+          code = decodeURIComponent(escape(atob(btn.dataset.codeCopyB64 || '')));
+        } catch {
+          code = '';
+        }
+        if (code) copyToClipboard(code, btn);
+      });
+    });
   }
 
   // Input gating, per the state machine in chat-ui-integration.md:
@@ -1488,16 +1626,15 @@ function chatBubble(m, triggeringUserSeq) {
           <div class="chat-card-head">
             <span class="node-pill node-${escapeHtml(m.node_id)}">${icon(NODE_ICON[m.node_id] || 'info')}${escapeHtml(titleCase(m.node_id))}</span>
             <span class="chat-card-time">${fmtRelativeTime(m.created_at)}</span>
-            <button type="button" class="btn-icon chat-copy-btn" data-copy-seq="${m.seq}" title="Copy message">⧉</button>
           </div>
           <div class="chat-card-content chat-markdown">${renderMarkdown(m.content)}</div>
         ` : `
           <div class="chat-card-content chat-markdown">
             <span class="chat-card-time-inline">${fmtRelativeTime(m.created_at)}</span>
-            <button type="button" class="btn-icon chat-copy-btn" data-copy-seq="${m.seq}" title="Copy message">⧉</button>
             ${renderMarkdown(m.content)}
           </div>
         `}
+        <button type="button" class="btn-icon chat-copy-btn chat-copy-btn--floating" data-copy-seq="${m.seq}" title="Copy message">⧉</button>
         ${lessonsUsed.length ? `
           <div class="tag-row" style="margin-top:8px;">
             <span class="badge purple" title="Lessons injected into this turn's prompt">${icon('book')} ${lessonsUsed.length} lesson${lessonsUsed.length === 1 ? '' : 's'} used</span>

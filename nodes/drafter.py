@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 from clients.llm import call_role, TruncatedOutputError, write_iteration_artifact
+from clients.tools import format_search_context
 from pipeline.guards import check_lazy_evaluation, check_ast_syntax
 from pipeline.state import PipelineState
 from schemas.execution import DraftOutput
@@ -34,7 +35,7 @@ def draft_node(state: PipelineState) -> dict:
     if not plan:
         raise ValueError("draft_node: plan_spec missing from state")
 
-    correction_block = _build_correction_context(state)
+    correction_block = _build_correction_context(state) + _build_search_context(state)
     dense_plan       = plan.model_dump_json(exclude_none=True)
 
     extra_messages: list[dict] = []
@@ -100,7 +101,7 @@ def draft_short_node(state: PipelineState) -> dict:
         raise ValueError("draft_short_node: plan_spec missing")
 
     use_thinking     = (complexity == "moderate")
-    correction_block = _build_correction_context(state)
+    correction_block = _build_correction_context(state) + _build_search_context(state)
     dense_plan       = plan.model_dump_json(exclude_none=True)
 
     profile = state.get("profile") or state.get("requested_profile")
@@ -220,6 +221,22 @@ def _finalize_draft(
     if escalation_history is not None:
         result["escalation_history"] = escalation_history
     return result
+
+
+def _build_search_context(state: PipelineState) -> str:
+    """
+    Web-search context for the draft prompt (see clients/tools.py's
+    format_search_context). "" when use_search is off.
+
+    Delivered by appending to the existing {correction_block} template var
+    rather than a new {search_block} slot, so this works without touching
+    config/prompts/draft.yaml / draft_short.yaml. If you'd rather have it
+    in its own labelled spot: add {search_block} to those two user_templates
+    and pass it as its own template var in the two call_role calls above
+    (always — "" when unused — or the literal placeholder leaks into the
+    prompt), instead of appending here.
+    """
+    return format_search_context(state.get("use_search"), state.get("search_notes"))
 
 
 def _build_correction_context(state: PipelineState) -> str:

@@ -982,6 +982,16 @@ def call_model(
 
     except Exception as exc:
         elapsed_ms = (time.perf_counter() - start_ts) * 1000
+        # Best-effort: usage/completion may not exist if the failure was in
+        # _stream_completion itself (before any usage object existed) — but
+        # if it was the create_with_completion repair call that failed,
+        # Instructor sometimes exposes the last raw completion via the
+        # exception itself (check InstructorRetryException's attributes —
+        # e.g. exc.last_completion or exc.n_attempts, depending on the
+        # instructor version). Log real values when available instead of a
+        # hardcoded 0/0, which reads as "the model produced nothing" when
+        # what actually happened is "the model produced something that
+        # didn't validate."
         _log_stage_entry(
             run_dir=run_dir, stage=stage, model_name=model_name, prompt_hash=prompt_hash,
             tokens_in=0, tokens_out=0, latency_ms=elapsed_ms,
@@ -1312,6 +1322,7 @@ def call_role(
     tools:           Optional[list[dict]]  = None,
     tool_impls:      Optional[dict]        = None,
     max_tool_rounds: int                   = 4,
+    tool_history_sink: Optional[list]      = None,
     profile:               Optional[str]   = None,
     current_model_override: Optional[str]  = None,
     allow_escalation:       bool           = True,
@@ -1388,6 +1399,16 @@ def call_role(
                           clients.tools.TOOL_IMPLEMENTATIONS when tools is set.
         max_tool_rounds: Cap on tool-call round-trips before forcing a final
                           answer. See call_model_with_tools's docstring.
+        tool_history_sink: Optional list the caller owns. When tools= is set
+                          and this is given, it is REPLACED IN PLACE with the
+                          ToolCallRecord list from the call that produced the
+                          returned result (so if escalation re-dispatches,
+                          the last dispatch wins). Lets a node keep what was
+                          searched/returned — call_role itself still returns
+                          ONLY the parsed schema object — WITHOUT switching
+                          to call_role_with_tool_history(), which bypasses
+                          profile/escalation/require_confirmation handling.
+                          Ignored when tools is empty.
         profile:         Active pipeline_profiles name for this run (routing.yaml).
                           "ultra" resolves this role straight to
                           resolve_ultra_model(role) up front (ladder's final
@@ -1586,6 +1607,8 @@ def call_role(
                 max_retries     = max_retries,
                 output_cap_override = output_cap_override,
             )
+            if tool_history_sink is not None:
+                tool_history_sink[:] = _tool_history
             return result
         return call_model(
             model_id        = mid,
@@ -1624,10 +1647,31 @@ def call_role(
     # field). Only fires if the FIRST attempt didn't already escalate for
     # truncation above (one escalation event per call_role invocation,
     # per design doc §2.3's "one step per failure").
+    #
+    # EXCEPTION: if the model is asking a human to resolve the ambiguity
+    # (require_confirmation=True, i.e. human_in_the_loop) AND it already
+    # produced a specific clarification_question, escalating first would
+    # ask the WRONG question — "should we try a bigger model?" — while
+    # hiding the actual question the classifier/planner wants answered.
+    # A bigger model doesn't fix genuine task ambiguity (as opposed to
+    # this model's own uncertainty about phrasing it couldn't otherwise
+    # resolve), and the person would only see the real question at all if
+    # they happened to decline escalation first (classifier.py/planner.py's
+    # `esc.result is not None` fallback) — two prompts for one decision,
+    # with the more useful one hidden behind the less useful one. Skip
+    # straight to returning `result` as-is: classifier.py/planner.py's
+    # existing confidence=="low" and clarification_question check (after
+    # call_role returns normally, no exception at all) halts for the real
+    # question directly. When require_confirmation=False (set-and-forget,
+    # no one to ask either way), this distinction is moot — fall through
+    # to normal escalation as before, since there's no confirmation prompt
+    # to have asked the wrong question via in the first place.
+    has_clarification_question = bool(getattr(result, "clarification_question", None))
     if (
         escalated_to is None
         and allow_escalation
         and getattr(result, "confidence", None) == "low"
+        and not (require_confirmation and has_clarification_question)
     ):
         next_model = next_escalation_model(role, model_id)
         if next_model:

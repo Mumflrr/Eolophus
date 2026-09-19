@@ -28,6 +28,33 @@ def _cfg() -> dict:
     return _routing_cfg
 
 
+def _max_iterations(cfg: dict, profile: str) -> int:
+    """
+    Correction-loop cap for THIS profile.
+
+    routing.yaml's correction_loop.max_iterations used to apply to every
+    profile, so a short run could churn through as many bugfix/validate
+    rounds as a long one (a "what's today's date" run spent ~12 minutes on
+    two DeepCoder-14B rounds before being cancelled). A profile can now set
+    its own cap — the same `max_iterations:` key pipeline_profiles.ultra
+    already carried (and which nothing read until now):
+
+        pipeline_profiles:
+          short:
+            max_iterations: 0
+
+    Profiles without the key fall back to correction_loop.max_iterations, so
+    behaviour is unchanged for them. route_after_validate stops the loop once
+    `iteration >= cap`, so a cap of 0 means: draft -> ONE bugfix pass ->
+    validate -> done, whatever the verdict (spec_problem included — it is
+    checked after the cap).
+    """
+    profile_cfg = (cfg.get("pipeline_profiles", {}) or {}).get(profile) or {}
+    if "max_iterations" in profile_cfg:
+        return int(profile_cfg["max_iterations"])
+    return cfg.get("correction_loop", {}).get("max_iterations", 4)
+
+
 # ── Profile resolution ────────────────────────────────────────────────────────
 #
 # Replaces classification.mode ("short"|"long") as the thing routers consult
@@ -232,7 +259,7 @@ def route_after_bugfix(state: PipelineState) -> str:
     profile    = resolve_profile(state)
     node_set   = node_set_for(profile)
     iteration  = state.get("iteration", 0)
-    max_iter   = cfg.get("correction_loop", {}).get("max_iterations", 4)
+    max_iter   = _max_iterations(cfg, profile)
 
     # Ensemble nodes (critic_a/critic_b) only exist in long/ultra's node_set
     # — short/medium have nowhere to route an ensemble trigger to, so treat
@@ -297,8 +324,8 @@ def route_after_validate(state: PipelineState) -> str:
     category   = getattr(verdict, "category", "unresolvable")
     iteration  = state.get("iteration", 0)
     cfg        = _cfg()
-    max_iter   = cfg.get("correction_loop", {}).get("max_iterations", 4)
     profile    = resolve_profile(state)
+    max_iter   = _max_iterations(cfg, profile)
 
     log.info("Router: verdict=%s iter=%d/%d profile=%s", category, iteration, max_iter, profile)
 

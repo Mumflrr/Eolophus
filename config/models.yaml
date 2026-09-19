@@ -106,7 +106,7 @@ roles:
   classify:          "9b"
   ideation:          "27b"
   plan:              "9b"
-  draft:             "35b"
+  draft:             "9b"
   draft_short:       "9b"
   appraise:          "deepcoder"
   bugfix:            "deepcoder"
@@ -191,7 +191,7 @@ escalation_ladders:
   classify:            ["35b"]
   ideation:            ["35b"]
   plan:                ["35b"]
-  draft:               []            # already 35b — no bigger model owned yet
+  draft:               ["35b"] 
   draft_short:         ["35b"]
   appraise:            ["35b"]
   bugfix:              ["35b"]

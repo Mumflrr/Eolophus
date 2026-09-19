@@ -1,0 +1,470 @@
+"""
+api/routers/chat.py — chat follow-up turns on an existing run.
+
+A chat is 1:1 with a run: chat_uuid == run_uuid (see api.js). POST /run
+creates both implicitly (the first "turn" is the original task). These
+endpoints handle FOLLOW-UP turns after that run reaches a terminal state.
+
+Lesson integration (per product requirement):
+  - On every chat turn, BEFORE re-entering the graph, retrieve relevant
+    lessons and record which ones were used against this specific turn
+    (storage/lesson_store.record_lesson_usage) — independent of the run
+    itself, so this survives the run/chat being deleted later, same as
+    lesson writes already do.
+  - Lesson WRITES on a chat turn reuse the existing distiller_node path
+    when the turn went through validate (both replan and lighter paths
+    eventually reach validate/distiller). The separate user-correction
+    detection path (chat_distiller_node) is not yet wired in — see the
+    stub and comment in nodes/distiller.py.
+"""
+
+from __future__ import annotations
+
+import logging
+import os
+from pathlib import Path
+from typing import Optional
+
+from fastapi import APIRouter, HTTPException
+
+from api import state
+from api.attachments import compose_input_with_attachments, load_live_attachments
+from api.json_utils import read_json, write_run_json
+from api.paths import get_chat_turn_dir, get_run_dir
+from api.schemas import ChatMessageIn
+from api.status import extract_reply_text, post_halt_chat_message, run_status, status_after_invoke
+
+log = logging.getLogger(__name__)
+
+router = APIRouter()
+
+
+@router.get("/chat/{run_uuid}")
+async def get_chat(run_uuid: str):
+    """Full message history for a chat, oldest-first, plus which lessons
+    were used on each assistant turn (for the runDetail.js sidebar)."""
+    from storage.chat_store import get_messages
+    from storage.lesson_store import get_lessons_used_for_chat
+
+    run_dir = get_run_dir(run_uuid)
+    messages = get_messages(run_uuid)
+    if not messages and not run_dir.exists():
+        raise HTTPException(status_code=404, detail="No chat or run found for this id")
+
+    lessons_by_seq = get_lessons_used_for_chat(run_uuid)
+    for m in messages:
+        used = lessons_by_seq.get(m["seq"])
+        if used:
+            m["lessons_used"] = used
+
+    return {"run_uuid": run_uuid, "messages": messages}
+
+
+@router.post("/chat/{run_uuid}")
+async def post_chat_message(run_uuid: str, req: ChatMessageIn):
+    """
+    Send a follow-up chat message. 409s if the underlying run is still
+    in-flight or paused for clarification — those go through POST /clarify
+    instead (see api.js comment on sendChatMessage).
+    """
+    from storage.chat_store import append_message, get_messages
+
+    run_dir = get_run_dir(run_uuid)
+    if not run_dir.exists():
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    status = run_status(run_uuid)
+    if status in state.ACTIVE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail="This run is still busy — wait for it to finish, or answer "
+                   "the pending clarification via POST /clarify first.",
+        )
+
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(status_code=400, detail="message cannot be empty")
+
+    if (req.requested_profile or not req.human_in_the_loop) and not req.replan:
+        raise HTTPException(
+            status_code=400,
+            detail="requested_profile/human_in_the_loop can only be set when "
+                   "replan=true — a non-replan turn never reaches "
+                   "classify_node/plan_node, so there's nothing to pin them to.",
+        )
+
+    user_seq = append_message(run_uuid, role="user", content=message)
+
+    run_json = read_json(run_dir / "run.json") or {}
+    pipeline_name = run_json.get("pipeline")  # None for built-in runs
+
+    write_run_json(run_dir, run_uuid, run_json.get("mode"), "running")
+    try:
+        from storage.critique_store import update_run_status
+        update_run_status(run_uuid, "running")
+    except Exception:
+        pass
+
+    history = get_messages(run_uuid)  # includes the turn we just appended
+
+    # env_overrides preserves whatever the original run was started with
+    # (see the env_overrides comment on _active_runs in runs.start_run) so
+    # a clarification raised mid-chat still resumes with the same env vars.
+    # Retired: the old per-turn PIPELINE_ULTRA/PIPELINE_FORCE_SHORT override
+    # block — req.requested_profile now flows into turn_state directly (see
+    # _run_chat_replan) and is read by classify_node/select_profile, not by
+    # env vars read from llm.py/routers.py.
+    env_overrides = dict(state.active_runs.get(run_uuid, {}).get("env_overrides", {}))
+
+    future = state.executor.submit(
+        _run_chat_turn_thread, run_uuid, str(run_dir), history, req.replan, pipeline_name, user_seq,
+        req.requested_profile, req.task_type, req.human_in_the_loop, env_overrides, req.use_search,
+    )
+    state.active_runs[run_uuid] = {
+        "future":        future,
+        "run_dir":       str(run_dir),
+        "env_overrides": env_overrides,
+    }
+
+    return {"status": "running", "run_uuid": run_uuid, "user_message_seq": user_seq}
+
+
+@router.delete("/chat/{run_uuid}")
+async def remove_chat(run_uuid: str):
+    """
+    Delete a chat's messages AND the per-turn artifact directories that
+    back them (run_dir/turns/*, see get_chat_turn_dir). Mirrors
+    chat_store.delete_chat's own contract: lessons and lesson_usage rows
+    are untouched, since lessons are deliberately chat-agnostic (see
+    schema_additions.sql) and must survive this.
+
+    Does NOT touch the top-level run artifacts (run.json, classification.json,
+    etc. sitting directly in run_dir) or the run row itself — those belong
+    to the original run, not the chat, and are removed only via
+    DELETE /run/{run_uuid}.
+
+    409s under the same condition as POST /chat: if a chat turn is
+    currently in flight, deleting out from under it could delete a turn
+    directory a background thread is mid-write to.
+    """
+    from storage.chat_store import delete_chat
+
+    status = run_status(run_uuid)
+    if status in state.ACTIVE_STATUSES:
+        raise HTTPException(
+            status_code=409,
+            detail="This run is still busy — wait for it to finish before deleting the chat.",
+        )
+
+    deleted_count = delete_chat(run_uuid)
+
+    turns_dir = get_run_dir(run_uuid) / "turns"
+    removed_dirs = 0
+    if turns_dir.exists():
+        import shutil
+        for seq_dir in turns_dir.iterdir():
+            if seq_dir.is_dir():
+                try:
+                    shutil.rmtree(seq_dir)
+                    removed_dirs += 1
+                except FileNotFoundError:
+                    pass
+        # Clean up the now-empty turns/ dir itself too.
+        try:
+            turns_dir.rmdir()
+        except OSError:
+            pass  # not empty (race with a concurrent write) or already gone
+
+    log.info(
+        "Chat deleted: run=%s (%d messages, %d turn artifact dirs)",
+        run_uuid, deleted_count, removed_dirs,
+    )
+    return {
+        "status":            "deleted",
+        "run_uuid":          run_uuid,
+        "messages_deleted":  deleted_count,
+        "turn_dirs_removed": removed_dirs,
+    }
+
+
+def _run_chat_turn_thread(
+    run_uuid:            str,
+    run_dir:             str,
+    history:             list[dict],
+    replan:              bool,
+    pipeline_name:       Optional[str],
+    turn_seq:            int,
+    requested_profile:   Optional[str] = None,
+    task_type_override:  Optional[str] = None,
+    human_in_the_loop:   bool = True,
+    env_overrides:       Optional[dict] = None,
+    use_search:          bool = False,
+) -> dict:
+    """
+    Background thread for a chat follow-up turn. Retrieves relevant lessons
+    up front (regardless of replan/lighter path — see module-level comment),
+    re-enters the graph, then persists the assistant reply as a chat turn
+    and records which lessons were actually used against it.
+
+    turn_seq is the user message's chat seq (assigned in post_chat_message)
+    and is used to give this turn's stage artifacts their own directory —
+    see get_chat_turn_dir. run_dir here stays the top-level run directory:
+    it's still what run.json status writes target, and it's what the
+    graph's OWN run_dir gets derived from for this turn.
+
+    requested_profile/task_type_override mirror RunRequest.requested_profile/
+    task_type, pinned into turn_state the same way runs.start_run pins them
+    into initial_state (only meaningful when replan=True — see the 400
+    raised in post_chat_message otherwise). human_in_the_loop mirrors
+    RunRequest.human_in_the_loop the same way. Retired: the old per-turn
+    PIPELINE_ULTRA/PIPELINE_FORCE_SHORT env-var window — profile now flows
+    through turn_state/requested_profile, read directly by classify_node.
+    env_overrides here is just whatever the run's persisted env vars are
+    (see post_chat_message), applied for this thread's duration same as
+    runs._run_pipeline_thread, with nothing chat-turn-specific added to it.
+
+    use_search mirrors RunRequest.use_search (see ChatMessageIn.use_search's
+    docstring for why this was missing entirely before and what that broke:
+    plan_node/ideation_node would silently skip their search_web() call on
+    every chat follow-up, without ever logging anything, since
+    state.get("use_search") just came back None). Passed straight through
+    to _run_chat_replan's turn_state regardless of replan, since that's the
+    only state-construction path a chat turn goes through today.
+    """
+    from storage.chat_store import append_message, format_history_for_prompt
+    from storage.critique_store import update_run_status
+
+    run_dir_path = Path(run_dir)
+    turn_dir     = get_chat_turn_dir(run_uuid, turn_seq)
+    turn_dir.mkdir(parents=True, exist_ok=True)
+    history_text = format_history_for_prompt(history)
+
+    # ── Lesson retrieval, up front, every turn ──────────────────────────
+    relevant_lessons = []
+    try:
+        from schemas.lesson import LessonQuery
+        from storage.lesson_store import retrieve_lessons
+        run_json = read_json(run_dir_path / "run.json") or {}
+        task_type = run_json.get("task_type", "coding")
+        relevant_lessons = retrieve_lessons(LessonQuery(
+            task_type=task_type,
+            tags=[],
+            top_k=5,
+            min_score=0.0,
+        ))
+    except Exception as e:
+        log.warning("Chat turn: lesson retrieval failed for %s: %s", run_uuid, e)
+
+    # Apply this run's persisted env vars for the duration of this thread
+    # only — same save/restore pattern as runs._run_pipeline_thread, kept
+    # as its own block since a chat turn's window must not leak past this
+    # thread's lifetime.
+    env_overrides = env_overrides or {}
+    saved_env = {}
+    with state.env_lock:
+        saved_env = {k: os.environ.get(k) for k in env_overrides}
+        for k, v in env_overrides.items():
+            os.environ[k] = v
+
+    try:
+        if replan:
+            final_state = _run_chat_replan(
+                run_uuid, run_dir_path, str(turn_dir), history_text,
+                pipeline_name, relevant_lessons,
+                requested_profile=requested_profile, task_type_override=task_type_override,
+                human_in_the_loop=human_in_the_loop,
+                use_search=use_search,
+            )
+        else:
+            # TODO(lighter path): re-enter the LangGraph checkpoint at
+            # draft/draft_short instead of classify, reusing the
+            # classification/plan_spec already sitting in MemorySaver
+            # under thread_id=run_uuid from the original run. This is NOT
+            # a plain app_graph.invoke() — LangGraph's conditional entry
+            # point is fixed at compile time (see route_after_input in
+            # graph.py), so a genuine "start partway through" re-entry
+            # needs either a second entry point wired into get_graph(),
+            # or driving it through the same interrupt()/Command(resume=)
+            # mechanism clarify_node uses. Deferring rather than guessing
+            # at LangGraph internals against nodes I haven't verified —
+            # falls back to the full replan path for now so lighter-path
+            # requests still work, just not more cheaply yet.
+            log.warning(
+                "Chat turn %s: lighter (non-replan) path not yet implemented, "
+                "falling back to full replan.", run_uuid,
+            )
+            final_state = _run_chat_replan(
+                run_uuid, run_dir_path, str(turn_dir), history_text, pipeline_name,
+                relevant_lessons, use_search=use_search,
+            )
+
+        status = status_after_invoke(run_uuid, final_state)
+
+        # Same cancellation-race guard as runs._run_pipeline_thread: don't
+        # let a chat turn that was still in-flight when the run got
+        # cancelled clobber "cancelled" back to a terminal status after
+        # the fact.
+        current = read_json(run_dir_path / "run.json") or {}
+        if current.get("status") == "cancelled":
+            log.info("Chat turn on run %s was cancelled mid-flight — discarding result", run_uuid)
+            return final_state
+
+        write_run_json(
+            run_dir_path, run_uuid, final_state.get("mode"), status,
+            profile=final_state.get("profile"),
+        )
+        update_run_status(run_uuid, status)
+
+        if status in ("waiting_for_clarification", "waiting_for_truncation_retry"):
+            # Previously this branch didn't exist at all: a halt mid-chat-
+            # turn fell straight into the "complete" reply-extraction path
+            # below, misreporting the run as finished and posting whatever
+            # extract_reply_text's fallback text happened to be instead of
+            # the actual question/truncation details. post_halt_chat_message
+            # reads the sentinel from the TURN directory (via
+            # active_sentinel_dir), which is what run_dir=turn_dir here
+            # means it will actually find.
+            post_halt_chat_message(run_uuid, run_dir_path, status)
+            return final_state
+
+        reply_text = extract_reply_text(final_state)
+        # No node currently stamps "which node produced this state" onto
+        # PipelineState (checked graph.py/state.py — no such field exists).
+        # Leaving node_id unset rather than inventing a key nothing writes to;
+        # runDetail.js's hasDetail already falls back to lessons-only detail
+        # when node_id is absent, so this doesn't break the UI, it just means
+        # chat turns won't show a node pill until a node actually reports this.
+        node_id = None
+        assistant_seq = append_message(
+            run_uuid, role="assistant", content=reply_text,
+            node_id=node_id, run_iteration=final_state.get("iteration"),
+        )
+
+        if relevant_lessons:
+            try:
+                from storage.lesson_store import record_lesson_usage
+                record_lesson_usage(run_uuid, assistant_seq, relevant_lessons)
+            except Exception as e:
+                log.warning("Failed to record lesson usage for %s seq %d: %s", run_uuid, assistant_seq, e)
+
+        return final_state
+
+    except Exception as exc:
+        log.exception("Chat turn on run %s failed with an uncaught exception", run_uuid)
+        write_run_json(
+            run_dir_path, run_uuid, None, "error",
+            error_detail=f"{type(exc).__name__}: {exc}",
+        )
+        try:
+            update_run_status(run_uuid, "error")
+        except Exception:
+            pass
+        append_message(run_uuid, role="system", content=f"Chat turn failed: {exc}")
+        raise
+    finally:
+        state.active_runs.pop(run_uuid, None)
+        with state.env_lock:
+            for k, v in saved_env.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
+def _run_chat_replan(
+    run_uuid:            str,
+    run_dir_path:        Path,
+    turn_run_dir:        str,
+    history_text:        str,
+    pipeline_name:       Optional[str],
+    relevant_lessons:    list,
+    requested_profile:   Optional[str] = None,
+    task_type_override:  Optional[str] = None,
+    human_in_the_loop:   bool = True,
+    use_search:          bool = False,
+) -> dict:
+    """Full graph re-entry at classify, with full chat history folded into
+    normalised_input. Reuses the same thread_id checkpoint as the original
+    run — LangGraph will still see prior state, but classify_node etc. run
+    fresh, which is the whole point of 'replan'.
+
+    requested_profile/task_type_override, when set, are pinned into
+    turn_state exactly like runs.start_run pins RunRequest.requested_profile/
+    task_type into initial_state. task_type_override maps to
+    classify_node's pinned_task_type branch, same as before. requested_profile
+    is a DIFFERENT concept from mode pinning (see classifier.py: mode
+    pinning controls what the classifier itself is told to keep fixed;
+    requested_profile picks the pipeline shape downstream of classification,
+    via select_profile()/resolved_profile — see classify_node's "Profile
+    resolution" comment) — it's passed straight through to turn_state and
+    read there, not translated into a pinned "mode" here. Without this, a
+    replanned chat turn could never be forced into e.g. "long", since
+    classify_node's own select_profile() would always decide, the same gap
+    that made runs.js's profile picker have no equivalent in chat follow-ups.
+
+    human_in_the_loop mirrors RunRequest.human_in_the_loop into turn_state,
+    same pin-through as requested_profile/task_type_override above — gates
+    whether classify_node/plan_node halt to ask before escalating models
+    for this turn, or auto-escalate/proceed best-effort with no one to ask.
+
+    use_search mirrors RunRequest.use_search into turn_state, same as
+    requested_profile/task_type_override above. Previously ABSENT from
+    turn_state entirely — not defaulted to False, just never set as a key
+    at all — so plan_node/ideation_node's state.get("use_search") read
+    back None on every chat follow-up regardless of what the ORIGINAL
+    run's RunRequest.use_search had been, or of a person re-enabling
+    search on a later turn: there was no plumbing from ChatMessageIn
+    through to here for it to even be a per-turn choice. This is why a
+    person could ask a follow-up question and get "I can't search" with
+    no error anywhere — search_web() was never being called, not failing.
+
+    run_dir_path is the top-level run directory (where attachments.json and
+    the attachments/ folder live) — kept separate from turn_run_dir (this
+    turn's own stage-artifact directory, see get_chat_turn_dir) since
+    attachments are run-scoped, not turn-scoped.
+
+    Live (non-excluded) attachments are re-folded into chat_input on every
+    call here — previously this only happened once, in start_run, from the
+    original request body. A replan's input was built from chat history
+    alone, so any attached file's content silently stopped being visible
+    to the model after the very first turn. Excluding an attachment (see
+    DELETE /run/{run_uuid}/attachments/{filename}) is what should make it
+    stop appearing here, not the accident of it being turn 2+."""
+    if pipeline_name:
+        from pipeline.custom_graph import get_custom_graph
+        app_graph = get_custom_graph(pipeline_name)
+        callbacks = []
+    else:
+        from pipeline.graph import get_graph
+        app_graph, callbacks = get_graph()
+
+    config = {"configurable": {"thread_id": run_uuid}}
+    if callbacks:
+        config["callbacks"] = callbacks
+
+    live_attachments = load_live_attachments(run_dir_path)
+    chat_input = (
+        f"{history_text}\n\n"
+        f"(Continue the task above based on the most recent user message.)"
+    )
+    chat_input = compose_input_with_attachments(chat_input, live_attachments)
+
+    turn_state: dict = {
+        "run_dir":          turn_run_dir,
+        "run_uuid":         run_uuid,
+        "iteration":        0,
+        "raw_text_input":   chat_input,
+        "normalised_input": chat_input,
+        "attachments":      live_attachments,
+        "pipeline_complete": False,
+        "pipeline_failed":   False,
+        "relevant_lessons":  relevant_lessons,
+        "use_search":        use_search,
+        "human_in_the_loop": human_in_the_loop,
+    }
+    if requested_profile and requested_profile != "auto":
+        turn_state["requested_profile"] = requested_profile
+    if task_type_override:
+        turn_state["task_type"] = task_type_override
+
+    return app_graph.invoke(turn_state, config=config)
