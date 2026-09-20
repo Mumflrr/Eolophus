@@ -72,47 +72,17 @@ def _existing_node_registry() -> dict[str, Callable]:
 def _wrap_existing_node(step: ExistingStep, base_fn: Callable) -> Callable:
     """
     Wraps a built-in node function to optionally apply this step's model/
-    budget overrides for the duration of the call.
-
-    SAFETY ASSUMPTION: this relies on os.environ being effectively
-    single-threaded from the pipeline's perspective — true today because
-    api/server.py's executor is ThreadPoolExecutor(max_workers=1) (one
-    GPU, one run at a time) and custom pipelines have no fan-out (steps
-    are strictly sequential per PipelineDefinition's design). If either
-    of those ever changes — multi-GPU concurrent runs, or a future
-    parallel-branch primitive added to PipelineDefinition — this env-var
-    approach becomes a race condition and must be replaced with a
-    contextvars-based or explicit-parameter override threaded through
-    call_role's signature instead. Flagging here so future-me doesn't
-    "clean this up" without noticing why it was safe before.
+    budget overrides for the duration of the call, via clients.llm's
+    step_overrides() context manager (a contextvars-based scope, correct
+    under concurrency — no shared lock, no manual restore-on-exit needed).
     """
     if step.model_override is None and step.budget_override is None:
         return base_fn   # no override — use the real function unmodified
 
     def _wrapped(state: dict) -> dict:
-        import os
-        # llm.py's call_role() reads PIPELINE_STEP_MODEL_OVERRIDE and
-        # PIPELINE_STEP_BUDGET_OVERRIDE immediately after role resolution
-        # (see call_role in clients/llm.py) and applies them for exactly
-        # this one call. Scoped here via try/finally so it can never leak
-        # into a sibling node's call even if this one raises.
-        prev_model  = os.environ.get("PIPELINE_STEP_MODEL_OVERRIDE")
-        prev_budget = os.environ.get("PIPELINE_STEP_BUDGET_OVERRIDE")
-        try:
-            if step.model_override:
-                os.environ["PIPELINE_STEP_MODEL_OVERRIDE"] = step.model_override
-            if step.budget_override is not None:
-                os.environ["PIPELINE_STEP_BUDGET_OVERRIDE"] = str(step.budget_override)
+        from clients.llm import step_overrides
+        with step_overrides(model=step.model_override, budget=step.budget_override):
             return base_fn(state)
-        finally:
-            if prev_model is None:
-                os.environ.pop("PIPELINE_STEP_MODEL_OVERRIDE", None)
-            else:
-                os.environ["PIPELINE_STEP_MODEL_OVERRIDE"] = prev_model
-            if prev_budget is None:
-                os.environ.pop("PIPELINE_STEP_BUDGET_OVERRIDE", None)
-            else:
-                os.environ["PIPELINE_STEP_BUDGET_OVERRIDE"] = prev_budget
 
     return _wrapped
 

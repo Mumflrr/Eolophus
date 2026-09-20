@@ -14,6 +14,17 @@
 #   4096 = thorough, use for complex tasks
 #   8192 = maximum, only for very complex multi-component plans
 
+# ── Thinking control ─────────────────────────────────────────────────────────
+# How "thinking on/off" is expressed to llama.cpp (see _build_thinking_extra_body
+# in clients/llm.py). The `thinking` object is always sent; with this on, the
+# request ALSO carries chat_template_kwargs.enable_thinking, which is the switch
+# llama.cpp documents for Qwen-style templates (--jinja). If a non-thinking stage
+# (classify, validate, audit, bugfix...) still produces hundreds of tokens for a
+# ~40-token JSON, the server is ignoring `thinking` and this is what turns it off.
+# Set to false to send only the legacy fields.
+thinking_control:
+  chat_template_kwargs: true
+
 thinking_budgets:
   # ── Planning stages ───────────────────────────────────────────────────────
   plan:        1024   # 9B planning — consistency check + scaffold + PlanSpec

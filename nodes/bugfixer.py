@@ -17,7 +17,7 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from clients.llm import call_role, write_iteration_artifact, TruncatedOutputError
+from clients.llm import call_role_with_repair, write_iteration_artifact
 from pipeline.guards import check_fixed_output_present
 from pipeline.state import PipelineState
 from schemas.execution import FixedOutput
@@ -76,76 +76,30 @@ def bugfix_node(state: PipelineState) -> dict:
         "correction_block":correction_block,
     }
 
-    # Was a single call relying only on Instructor's internal max_retries=1
-    # to self-correct malformed JSON. search_text/replace_text carry verbatim
-    # source code — quotes, backslashes, embedded newlines — which is exactly
-    # the content most prone to JSON-escaping mistakes (e.g. a model emitting
-    # an unescaped quote or dropping a comma between adjacent string fields,
-    # which breaks the JSON parser itself rather than failing Pydantic
-    # validation). When Instructor's one internal retry also fails, it raises
-    # InstructorRetryException, which — unlike classify_node/plan_node/
-    # draft_node — nothing here caught, so it propagated straight out of the
-    # node, past _wrap_node_for_truncation_retry (which only catches
-    # TruncatedOutputError), and crashed the whole run with status="error"
-    # and no failure_reason.
-    #
-    # Add the same outer retry loop those other nodes already use: catch the
-    # broader exception class (not just rely on Instructor's own internal
-    # retry), feed the exact parse/validation error back to the model, and
-    # try again up to max_attempts times before finally giving up.
-    max_attempts = 3
-    fixed = None
-    extra_messages: list[dict] = []
-
     profile = state.get("profile") or state.get("requested_profile")
     current_model_override = (state.get("escalated_models") or {}).get("bugfix")
 
-    for attempt in range(max_attempts):
-        try:
-            fixed: FixedOutput = call_role(
-                role            = "bugfix",
-                template_vars   = template_vars,
-                extra_messages  = extra_messages if extra_messages else None,
-                response_schema = FixedOutput,
-                stage           = "bugfix",
-                run_dir         = run_dir,
-                thinking        = False,
-                max_retries     = 1,
-                profile         = profile,
-                current_model_override = current_model_override,
-            )
-            break
-
-        except TruncatedOutputError:
-            # See classifier.py's identical guard — a token-cap truncation
-            # isn't a JSON validation failure, so retrying with the same cap
-            # plus a "please output valid JSON" nudge won't help, and
-            # wrapping it in RuntimeError below would hide it from
-            # pipeline/graph.py's generic truncation-retry wrapper.
-            raise
-
-        except Exception as e:
-            log.warning(
-                "Bugfix JSON validation failed (attempt %d/%d): %s",
-                attempt + 1, max_attempts, str(e)
-            )
-            if attempt == max_attempts - 1:
-                raise RuntimeError(
-                    f"Bugfix failed to produce valid FixedOutput after {max_attempts} attempts."
-                ) from e
-
-            extra_messages = [
-                {"role": "assistant", "content": "I provided malformed JSON."},
-                {
-                    "role": "user",
-                    "content": (
-                        f"Your previous output failed JSON parsing/validation:\n{str(e)}\n\n"
-                        f"Remember that search_text and replace_text must be valid JSON "
-                        f"strings — escape all quotes and backslashes, and separate every "
-                        f"field with a comma. Please try again with strict JSON compliance."
-                    ),
-                },
-            ]
+    # search_text/replace_text carry verbatim source code — quotes,
+    # backslashes, embedded newlines — which is exactly the content most
+    # prone to breaking JSON output outright (not just failing Pydantic
+    # validation). call_role_with_repair's outer retry loop catches that
+    # and feeds the error back, on top of call_role's own internal repair.
+    fixed: FixedOutput = call_role_with_repair(
+        role            = "bugfix",
+        repair_hint     = (
+            "search_text and replace_text must be valid JSON strings — "
+            "escape all quotes and backslashes, and separate every field "
+            "with a comma."
+        ),
+        template_vars   = template_vars,
+        response_schema = FixedOutput,
+        stage           = "bugfix",
+        run_dir         = run_dir,
+        thinking        = False,
+        max_retries     = 1,
+        profile         = profile,
+        current_model_override = current_model_override,
+    )
 
     # Apply diffs back onto the draft
     for fix in fixed.applied_fixes:

@@ -15,6 +15,7 @@ from typing import Optional
 from pydantic import BaseModel, Field
 
 from clients.llm import call_role
+from nodes._shared import derive_task_tags, record_escalation
 from pipeline.state import PipelineState
 
 log = logging.getLogger(__name__)
@@ -79,28 +80,13 @@ def distiller_node(state: PipelineState) -> dict:
 
     result = {"pipeline_complete": True}
 
-    # DistilledLesson has no confidence field — truncation is the only
-    # possible trigger here. This is deliberately NOT surfaced as a
-    # substantive lesson (see design doc §2.3: distiller should learn the
-    # task-solving difference, not the escalation event) — it's just
-    # infra bookkeeping for the run-detail UI's escalation badge, same as
-    # every other stage.
-    escalated_to_attr = getattr(lesson_output, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(lesson_output, "_escalated_from", None)
-        escalated_models   = dict(state.get("escalated_models") or {})
-        escalation_history = list(state.get("escalation_history") or [])
-        escalated_models["distiller"] = escalated_to_attr
-        escalation_history.append({
-            "stage":      "distiller",
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "truncation",
-            "iteration":  iteration,
-        })
-        log.info("Distiller escalated %s → %s", escalated_from_attr, escalated_to_attr)
-        result["escalated_models"]   = escalated_models
-        result["escalation_history"] = escalation_history
+    # DistilledLesson has no confidence field, so truncation is the only
+    # possible trigger — deliberately not surfaced as a substantive lesson
+    # (design doc §2.3: distiller learns the task-solving difference, not
+    # the escalation event), just bookkeeping for the run-detail UI.
+    if getattr(lesson_output, "_escalated_to", None):
+        result["escalated_models"], result["escalation_history"] = \
+            record_escalation(state, "distiller", lesson_output)
 
     return result
 
@@ -159,13 +145,7 @@ def _save_lesson(
         appraisal = state.get("appraisal_report")
 
         # Derive tags from plan's routing context
-        tags = [task_type]
-        if plan and plan.moe_routing_context:
-            ctx = plan.moe_routing_context.lower()
-            for kw in ["python", "fastapi", "async", "django", "typescript",
-                       "react", "database", "rest", "docker", "testing", "pydantic"]:
-                if kw in ctx:
-                    tags.append(kw)
+        tags = derive_task_tags(task_type, plan.moe_routing_context if plan else "")
 
         # Determine which model caught the issue
         critique = state.get("critique_record")

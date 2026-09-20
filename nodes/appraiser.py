@@ -15,6 +15,7 @@ import logging
 from pathlib import Path
 
 from clients.llm import call_role
+from nodes._shared import check_confidence_halt, record_escalation
 from pipeline.state import PipelineState
 from schemas.execution import AppraisalReport
 
@@ -52,37 +53,10 @@ def appraise_node(state: PipelineState) -> dict:
         current_model_override = current_model_override,
     )
 
-    escalated_models   = dict(state.get("escalated_models") or {})
-    escalation_history = list(state.get("escalation_history") or [])
-    escalated_to_attr  = getattr(report, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(report, "_escalated_from", None)
-        escalated_models["appraise"] = escalated_to_attr
-        escalation_history.append({
-            "stage":      "appraise",
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "low_confidence" if report.confidence != "low" else "truncation",
-            "iteration":  state.get("iteration", 0),
-        })
-        log.info("Appraise escalated %s → %s", escalated_from_attr, escalated_to_attr)
-
-    human_in_the_loop = state.get("human_in_the_loop", True)
-    if report.confidence == "low" and report.clarification_question:
-        if human_in_the_loop:
-            log.warning("Appraiser halted — needs human input: %s", report.clarification_question)
-            return {
-                "pipeline_halted":      True,
-                "clarification_needed": report.clarification_question,
-                "escalated_models":     escalated_models,
-                "escalation_history":   escalation_history,
-            }
-        log.warning(
-            "Appraiser confidence=low after escalation exhausted, but "
-            "human_in_the_loop=False (set-and-forget) — proceeding "
-            "best-effort. Original question was: %s",
-            report.clarification_question,
-        )
+    escalated_models, escalation_history = record_escalation(state, "appraise", report)
+    halt = check_confidence_halt(state, report, "Appraiser", escalated_models, escalation_history)
+    if halt:
+        return halt
 
     log.info(
         "Appraisal: %s satisfaction | critical=%d major=%d minor=%d | iq2s=%d",

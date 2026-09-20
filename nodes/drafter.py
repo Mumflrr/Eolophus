@@ -16,8 +16,9 @@ import logging
 from pathlib import Path
 from typing import Optional
 
-from clients.llm import call_role, TruncatedOutputError, write_iteration_artifact
+from clients.llm import call_role, call_role_with_repair, write_iteration_artifact
 from clients.tools import format_search_context
+from nodes._shared import check_confidence_halt, record_escalation
 from pipeline.guards import check_lazy_evaluation, check_ast_syntax
 from pipeline.state import PipelineState
 from schemas.execution import DraftOutput
@@ -38,51 +39,27 @@ def draft_node(state: PipelineState) -> dict:
     correction_block = _build_correction_context(state) + _build_search_context(state)
     dense_plan       = plan.model_dump_json(exclude_none=True)
 
-    extra_messages: list[dict] = []
-    draft = None
-    max_attempts = 3
-
     profile = state.get("profile") or state.get("requested_profile")
     current_model_override = (state.get("escalated_models") or {}).get("draft")
 
-    for attempt in range(max_attempts):
-        try:
-            draft: DraftOutput = call_role(
-                role            = "draft",
-                template_vars   = {
-                    "plan_json":        dense_plan,
-                    "correction_block": correction_block,
-                },
-                extra_messages  = extra_messages if extra_messages else None,
-                response_schema = DraftOutput,
-                stage           = "draft",
-                run_dir         = run_dir,
-                thinking        = True,
-                max_retries     = 0,
-                profile         = profile,
-                current_model_override = current_model_override,
-            )
-            break
-        except TruncatedOutputError:
-            # See classifier.py's identical guard — a token-cap
-            # truncation isn't a JSON validation failure, so retrying
-            # with the same cap plus a "please output valid JSON" nudge
-            # won't help, and wrapping it in RuntimeError below would
-            # hide it from pipeline/graph.py's generic truncation-retry
-            # wrapper. Propagate immediately instead.
-            raise
-        except Exception as e:
-            log.warning("Draft JSON validation failed (attempt %d/%d): %s", attempt + 1, max_attempts, e)
-            if attempt == max_attempts - 1:
-                raise RuntimeError(f"Drafter failed after {max_attempts} attempts.") from e
-            extra_messages = [
-                {"role": "assistant", "content": "I provided malformed JSON."},
-                {"role": "user", "content": f"Pydantic validation error:\n{e}\n\nPlease output valid JSON."},
-            ]
-
-    escalated_models, escalation_history, halt = _apply_escalation_and_confidence(
-        state, draft, "draft",
+    draft: DraftOutput = call_role_with_repair(
+        role            = "draft",
+        repair_hint     = "Please output valid JSON.",
+        template_vars   = {
+            "plan_json":        dense_plan,
+            "correction_block": correction_block,
+        },
+        response_schema = DraftOutput,
+        stage           = "draft",
+        run_dir         = run_dir,
+        thinking        = True,
+        max_retries     = 0,
+        profile         = profile,
+        current_model_override = current_model_override,
     )
+
+    escalated_models, escalation_history = record_escalation(state, "draft", draft)
+    halt = check_confidence_halt(state, draft, "Drafter (draft)", escalated_models, escalation_history)
     if halt:
         return halt
 
@@ -123,62 +100,12 @@ def draft_short_node(state: PipelineState) -> dict:
         current_model_override = current_model_override,
     )
 
-    escalated_models, escalation_history, halt = _apply_escalation_and_confidence(
-        state, draft, "draft_short",
-    )
+    escalated_models, escalation_history = record_escalation(state, "draft_short", draft)
+    halt = check_confidence_halt(state, draft, "Drafter (draft_short)", escalated_models, escalation_history)
     if halt:
         return halt
 
     return _finalize_draft(run_dir, draft, state, escalated_models, escalation_history)
-
-
-# ── Escalation + confidence helper ────────────────────────────────────────────
-# Shared by draft_node and draft_short_node — same pattern as classifier.py/
-# planner.py's inline versions, factored out here since drafter.py has two
-# call sites that both need it. See design doc §2.3/§2.6.
-
-def _apply_escalation_and_confidence(
-    state: PipelineState, draft: DraftOutput, stage_key: str,
-) -> tuple[dict, list, Optional[dict]]:
-    """
-    Returns (escalated_models, escalation_history, halt_dict_or_None).
-    If halt_dict_or_None is not None, the caller should return it
-    immediately instead of proceeding to _finalize_draft.
-    """
-    escalated_models   = dict(state.get("escalated_models") or {})
-    escalation_history = list(state.get("escalation_history") or [])
-    escalated_to_attr  = getattr(draft, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(draft, "_escalated_from", None)
-        escalated_models[stage_key] = escalated_to_attr
-        escalation_history.append({
-            "stage":      stage_key,
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "low_confidence" if draft.confidence != "low" else "truncation",
-            "iteration":  state.get("iteration", 0),
-        })
-        log.info("%s escalated %s → %s", stage_key, escalated_from_attr, escalated_to_attr)
-
-    human_in_the_loop = state.get("human_in_the_loop", True)
-    if draft.confidence == "low" and draft.clarification_question:
-        if human_in_the_loop:
-            log.warning("Drafter (%s) halted — needs human input: %s",
-                        stage_key, draft.clarification_question)
-            return escalated_models, escalation_history, {
-                "pipeline_halted":      True,
-                "clarification_needed": draft.clarification_question,
-                "escalated_models":     escalated_models,
-                "escalation_history":   escalation_history,
-            }
-        log.warning(
-            "Drafter (%s) confidence=low after escalation exhausted, but "
-            "human_in_the_loop=False (set-and-forget) — proceeding "
-            "best-effort. Original question was: %s",
-            stage_key, draft.clarification_question,
-        )
-
-    return escalated_models, escalation_history, None
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

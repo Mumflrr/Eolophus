@@ -1,0 +1,16 @@
+[run]
+branch = True
+source =
+    clients
+    nodes
+    pipeline
+    api
+    schemas
+    tests/live
+omit =
+    */tests/test_*
+    */tests/conftest.py
+    */tests/fakes.py
+[report]
+show_missing = True
+skip_empty = True

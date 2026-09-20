@@ -22,6 +22,7 @@ from clients.llm import call_role
 from clients.tools import (
     SEARCH_HINT, SEARCH_TOOL_SCHEMA, TOOL_IMPLEMENTATIONS, format_search_notes,
 )
+from nodes._shared import record_escalation
 from pipeline.state import PipelineState
 from schemas.ideation_output import IdeationOutput
 
@@ -67,20 +68,7 @@ def ideation_node(state: PipelineState) -> dict:
         current_model_override = current_model_override,
     )
 
-    escalated_models   = dict(state.get("escalated_models") or {})
-    escalation_history = list(state.get("escalation_history") or [])
-    escalated_to_attr  = getattr(ideation, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(ideation, "_escalated_from", None)
-        escalated_models["ideation"] = escalated_to_attr
-        escalation_history.append({
-            "stage":      "ideation",
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "truncation",   # IdeationOutput has no confidence field
-            "iteration":  state.get("iteration", 0),
-        })
-        log.info("Ideation escalated %s → %s", escalated_from_attr, escalated_to_attr)
+    escalated_models, escalation_history = record_escalation(state, "ideation", ideation)
 
     log.info(
         "Ideation: %d approaches | %d directions | %d components",

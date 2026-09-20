@@ -24,21 +24,9 @@ import urllib.request
 from pathlib import Path
 from typing import Optional
 
-import yaml
+from config.loader import get_models_config
 
 log = logging.getLogger(__name__)
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
-_config: dict = {}
-
-def _cfg() -> dict:
-    if not _config:
-        p = Path(__file__).parent.parent / "config" / "models.yaml"
-        with open(p) as f:
-            _config.update(yaml.safe_load(f))
-    return _config
-
 
 # ── State ─────────────────────────────────────────────────────────────────────
 
@@ -348,7 +336,7 @@ def _load_model(model_id: str) -> None:
     """
     global _current_model, _current_port, _server_process, _server_pgid, _adopted
 
-    cfg       = _cfg()
+    cfg       = get_models_config()
     model_cfg = cfg["models"][model_id]
     port      = model_cfg["port"]
 

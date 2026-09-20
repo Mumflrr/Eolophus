@@ -45,12 +45,6 @@ from schemas.plan_spec import PlanSpec
 from schemas.lesson import LessonQuery
 from storage.lesson_store import retrieve_lessons, format_lessons_for_prompt
 
-
-def _get_budget(stage: str) -> int:
-    from clients.llm import _get_thinking_budget
-    return _get_thinking_budget(stage)
-
-
 log = logging.getLogger(__name__)
 
 
