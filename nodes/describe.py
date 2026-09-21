@@ -23,6 +23,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 from openai import OpenAI
 from clients.model_manager import ensure_model_loaded
@@ -214,7 +215,7 @@ def describe_node(state: dict) -> dict:
             stats["rounds"] += 1
             force_final = bool(call_tools) and rounds > _MAX_TOOL_ROUNDS
 
-            create_kwargs = dict(
+            create_kwargs: dict[str, Any] = dict(
                 model       = model_id,
                 messages    = working_messages,
                 temperature = cfg.get("temperature", 0.6),

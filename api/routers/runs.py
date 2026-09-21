@@ -10,12 +10,14 @@ api/status.py but re-enter the graph differently).
 
 from __future__ import annotations
 
+from langchain_core.runnables import RunnableConfig
+from pipeline.state import PipelineState
 import json
 import logging
 import os
 import uuid
 from pathlib import Path
-from typing import Any, Optional
+from typing import cast, Any, Optional
 
 from fastapi import APIRouter, HTTPException
 from fastapi.responses import FileResponse
@@ -116,12 +118,12 @@ def _run_pipeline_thread(
             from pipeline.graph import get_graph
             app_graph, callbacks = get_graph()
 
-        config = {"configurable": {"thread_id": run_uuid}}
+        config: RunnableConfig = {"configurable": {"thread_id": run_uuid}}
         if callbacks:
             config["callbacks"] = callbacks
 
         write_run_json(run_dir, run_uuid, initial_state.get("mode"), "running")
-        final_state = app_graph.invoke(initial_state, config=config)
+        final_state = app_graph.invoke(cast(PipelineState, initial_state), config=config)
 
         # A node that called interrupt() (clarify_node, or the generic
         # truncation-retry wrapper) makes invoke() return early with an
@@ -506,7 +508,9 @@ async def add_attachments(run_uuid: str, req: AddAttachmentsIn):
     new_entries = write_attachments(run_dir, req.attachments)
 
     manifest_path = run_dir / "attachments.json"
-    manifest = read_json(manifest_path) or []
+    manifest = read_json(manifest_path)
+    if not isinstance(manifest, list):
+        manifest = []
     manifest.extend(new_entries)
     manifest_path.write_text(json.dumps(manifest, indent=2), encoding="utf-8")
 

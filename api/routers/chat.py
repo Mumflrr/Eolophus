@@ -20,10 +20,12 @@ Lesson integration (per product requirement):
 
 from __future__ import annotations
 
+from langchain_core.runnables import RunnableConfig
+from pipeline.state import PipelineState
 import logging
 import os
 from pathlib import Path
-from typing import Optional
+from typing import cast, Optional
 
 from fastapi import APIRouter, HTTPException
 
@@ -438,7 +440,7 @@ def _run_chat_replan(
         from pipeline.graph import get_graph
         app_graph, callbacks = get_graph()
 
-    config = {"configurable": {"thread_id": run_uuid}}
+    config: RunnableConfig = {"configurable": {"thread_id": run_uuid}}
     if callbacks:
         config["callbacks"] = callbacks
 
@@ -467,4 +469,4 @@ def _run_chat_replan(
     if task_type_override:
         turn_state["task_type"] = task_type_override
 
-    return app_graph.invoke(turn_state, config=config)
+    return app_graph.invoke(cast(PipelineState, turn_state), config=config)

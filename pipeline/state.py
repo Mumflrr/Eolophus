@@ -8,7 +8,7 @@ not content, except for small classification and routing objects.
 """
 
 from __future__ import annotations
-from typing import Optional, TypedDict
+from typing import Optional, TypedDict, Required
 
 from schemas.task_classification import TaskClassification, Mode, TaskType
 from schemas.visual_description   import VisualDescription
@@ -30,8 +30,8 @@ class PipelineState(TypedDict, total=False):
     """
 
     # ── Run metadata ──────────────────────────────────────────────────────────
-    run_uuid:           str             # UUID for this run; also the runs/ directory name
-    run_dir:            str             # Absolute path to runs/{run_uuid}/
+    run_uuid:           Required[str]             # UUID for this run; also the runs/ directory name
+    run_dir:            Required[str]             # Absolute path to runs/{run_uuid}/
     mode:               str             # "short" | "long"  (from TaskClassification)
     task_type:          str             # "coding" | "ideation" | "mixed"
     is_sub_spec:        bool            # True if this is a sub-spec run

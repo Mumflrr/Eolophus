@@ -11,15 +11,17 @@ gets a false "saved OK" that then blows up at run time.
 from __future__ import annotations
 
 import json
-
+from typing import TYPE_CHECKING
 from fastapi import APIRouter, HTTPException
 
 from api.schemas import PipelineDefIn
-
+if TYPE_CHECKING:
+    from schemas.pipeline_def import PipelineDefinition
+from schemas.pipeline_def import FeedbackMode
 router = APIRouter()
 
 
-def _wire_to_definition(body: PipelineDefIn) -> "PipelineDefinition":  # noqa: F821
+def _wire_to_definition(body: PipelineDefIn) -> PipelineDefinition:
     """Convert the API's flat wire format into the real tagged-union schema."""
     from schemas.pipeline_def import (
         PipelineDefinition, ExistingStep, FreeformStep, DecisionStep,
@@ -48,7 +50,7 @@ def _wire_to_definition(body: PipelineDefIn) -> "PipelineDefinition":  # noqa: F
                 user_template=s.user_template or "{input}",
                 input_key=s.input_key or "normalised_input",
                 output_key=s.output_key,
-                feedback_mode=s.feedback_mode or "auto",
+                feedback_mode=FeedbackMode(s.feedback_mode or "auto"),
             ))
         elif s.type == "decision":
             if not s.system_prompt or not s.outcomes:
@@ -64,7 +66,7 @@ def _wire_to_definition(body: PipelineDefIn) -> "PipelineDefinition":  # noqa: F
                 outcomes=[DecisionOutcome(**o) for o in s.outcomes],
                 is_loop_back=s.is_loop_back or False,
                 max_iterations=s.max_iterations,
-                feedback_mode=s.feedback_mode or "auto",
+                feedback_mode=FeedbackMode(s.feedback_mode or "auto"),
             ))
         else:
             raise HTTPException(400, f"Step '{s.id}': unknown type '{s.type}'")

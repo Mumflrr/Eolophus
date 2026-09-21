@@ -14,6 +14,8 @@ from __future__ import annotations
 import logging
 import os
 
+from langchain_core.runnables import RunnableConfig
+
 from fastapi import APIRouter, HTTPException
 
 from api import state
@@ -131,7 +133,7 @@ async def clarify_run(run_uuid: str, req: ClarifyRequest):
             from pipeline.graph import get_graph
             from langgraph.types import Command
             app_graph, callbacks = get_graph()
-            config = {"configurable": {"thread_id": run_uuid}}
+            config: RunnableConfig = {"configurable": {"thread_id": run_uuid}}
             if callbacks:
                 config["callbacks"] = callbacks
 
@@ -306,7 +308,7 @@ async def retry_truncated(run_uuid: str, req: RetryTruncatedRequest):
             from pipeline.graph import get_graph
             from langgraph.types import Command
             app_graph, callbacks = get_graph()
-            config = {"configurable": {"thread_id": run_uuid}}
+            config: RunnableConfig = {"configurable": {"thread_id": run_uuid}}
             if callbacks:
                 config["callbacks"] = callbacks
 

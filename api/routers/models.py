@@ -18,10 +18,10 @@ router = APIRouter()
 @router.get("/models")
 async def get_models():
     """List all configured models with health status and assigned roles."""
-    from clients.llm import _load_config
+    from config.loader import get_models_config
     from clients.model_manager import _is_port_alive, current_model
 
-    cfg     = _load_config()
+    cfg     = get_models_config()
     hot     = current_model()
     roles   = cfg.get("roles", {})
 
@@ -86,7 +86,8 @@ async def reassign_role(model_id: str, role: str):
         yaml.dump(cfg, f, default_flow_style=False, sort_keys=False)
 
     # Bust config cache
-    from clients.llm import _config_cache
-    _config_cache.clear()
+    from config.loader import reload_config
+
+    reload_config()
 
     return {"status": "updated", "role": role, "model_id": model_id}

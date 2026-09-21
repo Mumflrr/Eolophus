@@ -22,7 +22,7 @@ not something baked into this module.
 
 from __future__ import annotations
 
-from schemas.pipeline_def import PipelineDefinition, StepType, DecisionStep
+from schemas.pipeline_def import PipelineDefinition, StepType, DecisionStep, ExistingStep
 
 
 def validate_pipeline_definition(definition: PipelineDefinition) -> list[str]:
@@ -191,7 +191,7 @@ def _check_freeform_input_keys(definition: PipelineDefinition, step_by_id: dict)
     errors = []
 
     for step in definition.steps:
-        if step.type in (StepType.FREEFORM, StepType.DECISION):
+        if isinstance(step, (FreeformStep, DecisionStep)):
             if step.input_key not in available:
                 errors.append(
                     f"Step '{step.id}' reads input_key '{step.input_key}', which no "

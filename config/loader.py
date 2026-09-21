@@ -86,3 +86,8 @@ def get_output_token_cap(stage: str) -> Optional[int]:
     """output_token_caps.<stage> from routing.yaml, or None (unbounded)."""
     cap = get_routing_config().get("output_token_caps", {}).get(stage)
     return int(cap) if cap else None
+
+def reload_config() -> None:
+    """Drop both cached configs; the next get_*_config() call rereads from disk."""
+    _models_cache.clear()
+    _routing_cache.clear()

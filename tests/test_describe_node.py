@@ -30,7 +30,6 @@ def env(monkeypatch):
     monkeypatch.setattr(D, "_log_stage_entry", lambda *a, **k: e.stage_logs.append((a, k)))
     monkeypatch.setattr(D, "ensure_model_loaded", lambda k: False)
     monkeypatch.setattr(llm, "next_escalation_model", lambda stage, cur: None)
-    monkeypatch.delenv("PIPELINE_STEP_OUTPUT_CAP_OVERRIDE", raising=False)
     monkeypatch.setitem(tools_mod.TOOL_IMPLEMENTATIONS, "search_web",
                         lambda a: e.searched.append(a["query"]) or "[Web search results]\n1. Friday, September 18, 2026")
 
@@ -155,10 +154,25 @@ def test_zero_budget_disables_thinking(env):
         "thinking": {"type": "disabled"}, "chat_template_kwargs": {"enable_thinking": False}}
 
 
-def test_output_cap_override_env_wins(env, monkeypatch):
-    monkeypatch.setenv("PIPELINE_STEP_OUTPUT_CAP_OVERRIDE", "32000")
-    _, fake, _ = env.go([completion(Msg("a"))])
+def test_output_cap_override_wins(env):
+    """
+    The truncation-retry wrapper (pipeline/graph.py) re-runs a node with a higher cap via
+    clients.llm.step_overrides(output_cap=...). That replaced the old PIPELINE_STEP_OUTPUT_CAP_OVERRIDE
+    env var (see the ContextVar note at the top of clients/llm.py), so this drives the real mechanism.
+
+    If this fails with 16000, describe_node reads the cap from routing.yaml only and never consults the
+    ContextVar — i.e. a retry-with-higher-cap on `describe` would silently do nothing.
+    """
+    with llm.step_overrides(output_cap=32000):
+        _, fake, _ = env.go([completion(Msg("a"))])
     assert fake.calls[0]["max_tokens"] == 32000
+
+
+def test_output_cap_override_does_not_leak_out_of_its_block(env):
+    with llm.step_overrides(output_cap=32000):
+        pass
+    _, fake, _ = env.go([completion(Msg("a"))])
+    assert fake.calls[0]["max_tokens"] == 16000            # back to the routing.yaml value
 
 
 # ── runaway-thinking recovery ────────────────────────────────────────────────

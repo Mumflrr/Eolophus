@@ -9,7 +9,6 @@ import json
 from types import SimpleNamespace
 
 import pytest
-import yaml
 from pydantic import BaseModel
 
 from clients import llm
@@ -19,15 +18,66 @@ from clients import llm
 
 @pytest.fixture
 def routing(monkeypatch):
-    """Make the budget lookup read a dict we control instead of config/routing.yaml."""
+    """
+    Make the budget / switch lookups see a routing config we control instead of config/routing.yaml.
+
+    config/loader.py caches the parsed YAML, so patching yaml.safe_load alone only works for whichever test
+    happens to run while the cache is still empty. Two cases, because they exercise different layers:
+
+      routing({...})            a config that PARSED fine. Replace the cached-config accessor, so the
+                                readers (get_thinking_budget / get_thinking_control_flag) run for real
+                                against our dict. A sentinel probe fails loudly if that patch can't reach
+                                them (e.g. the loader starts binding the accessor at import time).
+
+      routing(SomeException)    a config that COULD NOT BE READ. The "fall back to the default" behaviour
+                                lives inside get_routing_config itself (it catches the read/parse error),
+                                and the readers deliberately call it with no try/except of their own. So
+                                replacing the accessor with a raiser would test nothing real: it skips the
+                                very code under test and hands the readers an exception they were never
+                                meant to see. Instead make the FILE READ fail, one layer below, and
+                                reload the loader so no cache filled by an earlier test can mask it.
+                                The reload re-runs the module in the same module dict, so the aliases
+                                clients/llm.py holds (_get_thinking_budget etc.) see the fresh, empty cache.
+
+    Teardown ORDER matters for the exception case, which is why yaml.safe_load is patched by hand here and
+    not through monkeypatch: the loader must be reloaded AFTER the real safe_load is back. With
+    monkeypatch, its undo runs after this fixture's teardown, so a reload in teardown re-reads through the
+    still-broken safe_load, re-caches the failure, and the NEXT test silently gets default values.
+    """
+    import importlib
+    import yaml
+    from config import loader
+
+    real_safe_load = yaml.safe_load
+    patched_yaml = {"on": False}
+
     def install(data):
         if isinstance(data, Exception):
-            def boom(f):
+            def unreadable(*a, **k):
                 raise data
-            monkeypatch.setattr(yaml, "safe_load", boom)
-        else:
-            monkeypatch.setattr(yaml, "safe_load", lambda f: data)
-    return install
+            yaml.safe_load = unreadable
+            patched_yaml["on"] = True
+            importlib.reload(loader)
+            return
+
+        def accessor(*a, **k):
+            return data
+        monkeypatch.setattr(loader, "get_routing_config", accessor)
+
+        probe = "__routing_fixture_probe__"
+        probed = dict(data, thinking_budgets={**(data.get("thinking_budgets") or {}), probe: 31337})
+        monkeypatch.setattr(loader, "get_routing_config", lambda *a, **k: probed)
+        assert llm._get_thinking_budget(probe) == 31337, (
+            "routing fixture can't reach the loader: config.loader.get_thinking_budget no longer reads "
+            "get_routing_config by name at call time, so this fixture must patch wherever it binds it")
+        monkeypatch.setattr(loader, "get_routing_config", accessor)
+
+    try:
+        yield install
+    finally:
+        if patched_yaml["on"]:
+            yaml.safe_load = real_safe_load     # undo FIRST ...
+            importlib.reload(loader)            # ... then drop the cache the failure populated
 
 
 def test_a_configured_zero_reads_back_as_zero_not_2048(routing):
@@ -216,8 +266,10 @@ def cm(monkeypatch, fake_model_manager):
         return {"base_url": "http://x/v1", "model_id": "q9", "name": "Qwen3.5-9B", "temperature": 0.6,
                 "top_p": 0.9, **e.cfg_extra}
 
-    def fake_stream(client, model_id, messages, temp, top_p, extra_body, stage, max_tokens=None, reasoning_sink=None):
-        e.stream_calls.append({"extra_body": extra_body, "stage": stage, "max_tokens": max_tokens})
+    def fake_stream(client, model_id, messages, temp, top_p, extra_body, stage, max_tokens=None, reasoning_sink=None,
+                    presence_penalty=None):
+        e.stream_calls.append({"extra_body": extra_body, "stage": stage, "max_tokens": max_tokens,
+                               "presence_penalty": presence_penalty})
         if reasoning_sink is not None:
             reasoning_sink.extend(e.reasoning)
         usage = SimpleNamespace(prompt_tokens=50, completion_tokens=20)
@@ -324,3 +376,45 @@ def test_truncation_merges_reasoning_with_an_open_think_tag_in_content(cm):
     with pytest.raises(llm.TruncatedOutputError) as exc:
         cm.run(thinking=True)
     assert "from reasoning_content" in exc.value.thinking_block and "from content" in exc.value.thinking_block
+
+# ── presence_penalty: forwarded only when a model config sets one ─────────────
+# (35b's presence_penalty: 1.0 "prevents infinite loops in <think>" — it was declared in models.yaml
+#  for a long time but no call site read it, so it did nothing. These pin that it now reaches the wire,
+#  and that a model WITHOUT one still sends nothing rather than an explicit 0.0.)
+
+def test_call_model_forwards_the_configured_presence_penalty(cm):
+    cm.cfg_extra = {"presence_penalty": 1.0}
+    cm.run(thinking=False)
+    assert cm.stream_calls[-1]["presence_penalty"] == 1.0
+
+
+def test_call_model_passes_none_when_the_model_has_no_presence_penalty(cm):
+    cm.run(thinking=False)
+    assert cm.stream_calls[-1]["presence_penalty"] is None
+
+
+def test_an_explicit_zero_is_forwarded_not_mistaken_for_unset(cm):
+    """`if presence_penalty:` would drop a deliberate 0.0; the code must test `is not None`."""
+    cm.cfg_extra = {"presence_penalty": 0.0}
+    cm.run(thinking=False)
+    assert cm.stream_calls[-1]["presence_penalty"] == 0.0
+
+
+def _sent_kwargs(presence_penalty):
+    """Run the REAL _stream_completion against a client that records what it was asked to send."""
+    client = FakeStreamClient([chunk(content="ok", finish="stop")])
+    llm._stream_completion(client, "q9", [{"role": "user", "content": "u"}], 0.6, 0.95, None, "classify",
+                           max_tokens=100, presence_penalty=presence_penalty)
+    return client.calls[0]
+
+
+def test_stream_completion_sends_presence_penalty_when_set():
+    assert _sent_kwargs(1.0)["presence_penalty"] == 1.0
+
+
+def test_stream_completion_omits_the_field_entirely_when_unset():
+    assert "presence_penalty" not in _sent_kwargs(None)
+
+
+def test_stream_completion_sends_an_explicit_zero():
+    assert _sent_kwargs(0.0)["presence_penalty"] == 0.0

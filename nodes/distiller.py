@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import logging
 import uuid
-from typing import Optional
+from typing import Any, Optional
 from pydantic import BaseModel, Field
 
 from clients.llm import call_role
@@ -53,7 +53,7 @@ def distiller_node(state: PipelineState) -> dict:
         )
         return {"pipeline_complete": state.get("pipeline_complete", True)}
 
-    task_type = state.get("task_type", "coding")
+    task_type: str = state.get("task_type") or "coding"
 
     profile = state.get("profile") or state.get("requested_profile")
     current_model_override = (state.get("escalated_models") or {}).get("distiller")
@@ -78,7 +78,7 @@ def distiller_node(state: PipelineState) -> dict:
     else:
         log.debug("Distiller: fix was not universally valuable — skipping")
 
-    result = {"pipeline_complete": True}
+    result: dict[str, Any] = {"pipeline_complete": True}
 
     # DistilledLesson has no confidence field, so truncation is the only
     # possible trigger — deliberately not surfaced as a substantive lesson

@@ -8,6 +8,7 @@ The graph is compiled once at module load and reused across runs.
 
 from __future__ import annotations
 
+from langchain_core.runnables import RunnableConfig
 import logging
 import os
 import sqlite3
@@ -336,7 +337,7 @@ def _run_sub_spec(
 
     try:
         app, callbacks = get_graph()
-        config = {"configurable": {"thread_id": sub_uuid}}
+        config: RunnableConfig = {"configurable": {"thread_id": sub_uuid}}
         if callbacks:
             config["callbacks"] = callbacks
         final_state = app.invoke(initial_state, config=config)

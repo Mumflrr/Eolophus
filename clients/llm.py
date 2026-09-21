@@ -462,10 +462,14 @@ def _build_logit_bias(model_cfg: dict) -> Optional[dict[str, float]]:
 
 # ── LLMLingua-2 compression ───────────────────────────────────────────────────
 
-_lingua_compressor = None
+_lingua_compressor: Any = None
+_lingua_unavailable: bool = False
 
-def _get_compressor():
-    global _lingua_compressor
+def _get_compressor() -> Any:
+    """Returns the LLMLingua PromptCompressor, or None if llmlingua isn't installed."""
+    global _lingua_compressor, _lingua_unavailable
+    if _lingua_unavailable:
+        return None
     if _lingua_compressor is None:
         try:
             from llmlingua import PromptCompressor
@@ -477,8 +481,9 @@ def _get_compressor():
             log.info("LLMLingua-2 compressor initialised")
         except ImportError:
             log.warning("llmlingua not installed — compression disabled. pip install llmlingua")
-            _lingua_compressor = "unavailable"
-    return _lingua_compressor if _lingua_compressor != "unavailable" else None
+            _lingua_unavailable = True
+            return None
+    return _lingua_compressor
 
 
 def compress_text(
@@ -500,7 +505,7 @@ def compress_text(
 
     try:
         result = compressor.compress_prompt(
-            text,
+            [text],
             rate=ratio,
             force_tokens=["\n"],
         )
@@ -633,7 +638,7 @@ def _log_stage_entry(
         f.write(json.dumps(entry) + "\n")
 
     try:
-        from langfuse.decorators import langfuse_context
+        from langfuse.decorators import langfuse_context  # pyright: ignore[reportMissingImports]
         langfuse_context.update_current_observation(
             metrics={
                 "model_load_ms": round(load_ms, 1),
@@ -1363,12 +1368,22 @@ class EscalationNeeded(Exception):
                           object to return — the caller falls back to
                           exc.__cause__ / re-raising if declined)
     """
-    def __init__(self, stage, current_model_id, next_model_id, trigger, result=None):
+    def __init__(
+        self,
+        stage:            str,
+        current_model_id: str,
+        next_model_id:    str,
+        trigger:          str,
+        result:           Optional[Any] = None,
+    ):
         self.stage             = stage
         self.current_model_id  = current_model_id
         self.next_model_id     = next_model_id
         self.trigger           = trigger
-        self.result            = result
+        # Any (not BaseModel): callers immediately use it as their own
+        # response_schema type (TaskClassification, PlanSpec, ...), and this
+        # exception is deliberately schema-agnostic.
+        self.result: Optional[Any] = result
         super().__init__(
             f"Stage '{stage}' wants to escalate {current_model_id} → "
             f"{next_model_id} ({trigger}) — awaiting confirmation."
@@ -1555,6 +1570,12 @@ def call_role(
     starting_model_id = model_id
     escalated_to: Optional[str] = None
 
+    if response_schema is None:
+        # call_model()/call_model_with_tools() both require a schema (Instructor
+        # can't parse without one). Fail loudly and early instead of deep inside.
+        raise ValueError(f"call_role('{role}', stage='{stage}') requires response_schema=")
+    _schema: Type[T] = response_schema
+
     def _dispatch(mid: str):
         if tools:
             impls = tool_impls
@@ -1566,7 +1587,7 @@ def call_role(
                 messages        = final_messages,
                 tools           = tools,
                 tool_impls      = impls,
-                response_schema = response_schema,
+                response_schema = _schema,
                 stage           = stage,
                 run_dir         = run_dir,
                 thinking        = thinking,
@@ -1581,7 +1602,7 @@ def call_role(
         return call_model(
             model_id        = mid,
             messages        = final_messages,
-            response_schema = response_schema,
+            response_schema = _schema,
             stage           = stage,
             run_dir         = run_dir,
             thinking        = thinking,
@@ -1684,7 +1705,7 @@ def call_role_with_repair(
     repair_hint:  str = "Please output valid JSON.",
     max_attempts: int = 3,
     **call_role_kwargs,
-) -> T:
+) -> T:  # pyright: ignore[reportInvalidTypeVarUse]
     """
     call_role() wrapped in a retry loop for when the model's ENTIRE answer
     fails to parse — a malformed top-level payload, not just a field
@@ -1718,8 +1739,11 @@ def call_role_with_repair(
                 {"role": "user",      "content": f"Your previous output failed validation:\n{e}\n\n{repair_hint}"},
             ]
 
+    # Unreachable: the final attempt above either returns or raises.
+    raise RuntimeError(f"{label}: call_role_with_repair exited retry loop unexpectedly")
 
-def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecord"]]:
+
+def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecord"]]:  # pyright: ignore[reportInvalidTypeVarUse]
     """
     Same as call_role(role, ..., tools=[...]), but also returns the
     ToolCallRecord history (which tools were called, with what arguments,
@@ -1747,6 +1771,12 @@ def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecor
 
     model_id = resolve_role(role)
     stage    = kwargs.get("stage") or role
+    response_schema_arg = kwargs.get("response_schema")
+    if response_schema_arg is None:
+        raise ValueError(
+            f"call_role_with_tool_history('{role}') requires response_schema= "
+            f"(call_model_with_tools can't parse a final answer without one)."
+        )
     tool_impls = kwargs.get("tool_impls")
     if tool_impls is None:
         from clients.tools import TOOL_IMPLEMENTATIONS as _default_tool_impls
@@ -1762,14 +1792,14 @@ def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecor
         final_messages = build_messages_from_prompt(
             role            = role,
             template_vars   = kwargs.get("template_vars") or {},
-            response_schema = kwargs.get("response_schema"),
+            response_schema = response_schema_arg,
             extra_messages  = kwargs.get("extra_messages"),
         )
     else:
         has_system = any(m.get("role") == "system" for m in messages)
         if not has_system and prompt_def.get("system"):
             system_text = _safe_format(prompt_def["system"], kwargs.get("template_vars") or {})
-            response_schema = kwargs.get("response_schema")
+            response_schema = response_schema_arg
             if response_schema and _schema_has_confidence(response_schema):
                 system_text = system_text.rstrip() + "\n" + _CONFIDENCE_INSTRUCTION
             messages = [{"role": "system", "content": system_text}] + messages
@@ -1783,7 +1813,7 @@ def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecor
         messages        = final_messages,
         tools           = tools,
         tool_impls      = tool_impls,
-        response_schema = kwargs.get("response_schema"),
+        response_schema = response_schema_arg,
         stage           = stage,
         run_dir         = kwargs.get("run_dir", ""),
         thinking        = thinking,

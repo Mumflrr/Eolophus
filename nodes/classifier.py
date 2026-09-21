@@ -13,6 +13,7 @@ unpinned case only.
 from __future__ import annotations
 
 import logging
+from enum import Enum
 from pathlib import Path
 
 from clients.llm import (
@@ -44,6 +45,25 @@ _SYSTEM_PINNED_BOTH = """You are a task classifier for a local LLM pipeline.
 The MODE and TASK TYPE have been pinned by the user — do not change them.
 Determine: complexity, decompose, confidence, clarification_question.
 """
+
+
+def _as_db_str(value, default: str = "auto") -> str:
+    """
+    Coerce a mode / task_type / complexity value to the plain string
+    storage.write_run expects.
+
+    These fields can be a str (pinned by the caller), an Enum (from
+    TaskClassification), or None (nothing pinned and the model didn't set
+    one). Enums must go through .value: str(Mode.CODING) yields
+    "Mode.CODING", which would silently store the wrong text. None falls
+    back to "auto", the same placeholder runs.start_run already writes
+    for these columns before classification has run.
+    """
+    if value is None:
+        return default
+    if isinstance(value, Enum):
+        return str(value.value)
+    return str(value)
 
 
 def classify_node(state: PipelineState) -> dict:
@@ -82,14 +102,14 @@ def classify_node(state: PipelineState) -> dict:
     human_in_the_loop = state.get("human_in_the_loop", True)
 
     max_attempts  = 3
-    classification = None
+    classification: Optional[TaskClassification] = None
     extra_messages: list[dict] = []
     escalated_models   = dict(state.get("escalated_models") or {})
     escalation_history = list(state.get("escalation_history") or [])
 
     for attempt in range(max_attempts):
         try:
-            classification: TaskClassification = call_role(
+            classification = call_role(
                 role            = "classify",
                 messages        = messages,
                 template_vars   = {"task": task} if messages is None else None,
@@ -129,15 +149,22 @@ def classify_node(state: PipelineState) -> dict:
                 # actually ambiguous — keep it. Only fall back to a
                 # generic prompt when the model didn't give us one to work
                 # with (schema allows null even at confidence=low).
-                classification = esc.result
-                if not classification.clarification_question:
-                    classification = classification.model_copy(update={
+                if esc.result is None:
+                    # call_role always attaches result for trigger=="low_confidence";
+                    # fail loudly if that invariant ever breaks.
+                    raise RuntimeError(
+                        "EscalationNeeded(low_confidence) carried no result"
+                    ) from esc
+                esc_result: TaskClassification = esc.result
+                if not esc_result.clarification_question:
+                    esc_result = esc_result.model_copy(update={
                         "clarification_question": (
                             "I'm not fully confident in this classification "
                             "and could use more direction before continuing — "
                             "what would help clarify the task?"
                         ),
                     })
+                classification = esc_result
                 log.info(
                     "Classify: low confidence on '%s' — asking for clarification "
                     "instead of escalating to '%s'",
@@ -245,6 +272,11 @@ def classify_node(state: PipelineState) -> dict:
             # For Mode B (pinned), rebuild messages without extra_messages
             # (extra_messages is appended by call_role)
 
+    # The loop either breaks with a classification or raises on its last
+    # attempt; make that explicit (and narrow Optional[TaskClassification]).
+    if classification is None:
+        raise RuntimeError("Classifier exited retry loop without a result")
+
     final_mode      = pinned_mode      or classification.mode
     final_task_type = pinned_task_type or classification.task_type
 
@@ -346,9 +378,9 @@ def classify_node(state: PipelineState) -> dict:
 
     write_run(
         run_uuid        = state["run_uuid"],
-        mode            = final_mode,
-        task_type       = final_task_type,
-        complexity      = classification.complexity,
+        mode            = _as_db_str(final_mode),
+        task_type       = _as_db_str(final_task_type),
+        complexity      = _as_db_str(classification.complexity),
         is_sub_spec     = state.get("is_sub_spec", False),
         parent_run_uuid = state.get("parent_run_uuid"),
     )

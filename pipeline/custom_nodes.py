@@ -16,7 +16,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional, Protocol, cast
 
 from pydantic import BaseModel, Field, create_model
 from langgraph.graph import END
@@ -43,6 +43,14 @@ class FreeformOutput(BaseModel):
         description="high/medium/low. low halts the pipeline for human input."
     )
     clarification_question: Optional[str] = Field(default=None)
+
+
+class _DecisionResult(Protocol):
+    """Static shape of the dynamically-built DecisionOutput (see _build_decision_schema).
+    create_model() output is opaque to type checkers, so this documents the fields
+    the decision node reads."""
+    decision: str
+    reasoning: str
 
 
 def _build_decision_schema(outcomes: list[str]) -> type[BaseModel]:
@@ -199,7 +207,7 @@ def make_decision_node(step: DecisionStep):
             {"role": "user",   "content": user_content},
         ]
 
-        result = call_model(
+        result = cast(_DecisionResult, call_model(
             model_id        = step.model,
             messages        = messages,
             response_schema = schema,
@@ -208,7 +216,7 @@ def make_decision_node(step: DecisionStep):
             thinking        = step.thinking,
             budget_tokens   = step.budget_tokens,
             max_retries     = 0,
-        )
+        ))
 
         log.info("Decision '%s' -> %s (%s)", step.id, result.decision, result.reasoning[:80])
 
@@ -225,7 +233,7 @@ def make_decision_node(step: DecisionStep):
         decisions = dict(state.get("custom_decisions") or {})
         decisions[step.id] = result.decision
 
-        update = {
+        update: dict[str, Any] = {
             "custom_decisions":   decisions,
             "custom_iter_counts": iter_counts,
         }
@@ -266,7 +274,7 @@ def make_decision_router(step: DecisionStep, max_iterations_override: Optional[i
     def _router(state: dict) -> str:
         decisions = state.get("custom_decisions") or {}
         decision  = decisions.get(step.id)
-        current_target = outcome_map.get(decision)
+        current_target = outcome_map.get(decision) if decision is not None else None
 
         if step.is_loop_back and cap is not None:
             iter_counts = state.get("custom_iter_counts") or {}

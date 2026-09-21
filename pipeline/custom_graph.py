@@ -17,9 +17,10 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
 from langgraph.checkpoint.sqlite import SqliteSaver
+from langgraph.graph.state import CompiledStateGraph
 from langgraph.graph import StateGraph, END
 
 from pipeline.state import PipelineState
@@ -120,7 +121,8 @@ def _make_global_cap_wrapper(node_fn: Callable, definition: PipelineDefinition) 
 
 # ── Graph compilation ──────────────────────────────────────────────────────
 
-_compiled_cache: dict[str, tuple[float, object, object]] = {}   # name -> (mtime, saver_cm, compiled_app)
+# name -> (mtime, saver_cm, compiled_app)
+_compiled_cache: dict[str, tuple[float, Any, CompiledStateGraph]] = {}
 
 
 def load_pipeline_definition(name: str) -> PipelineDefinition:
@@ -134,7 +136,7 @@ def load_pipeline_definition(name: str) -> PipelineDefinition:
     return PipelineDefinition.model_validate(raw)
 
 
-def get_custom_graph(name: str):
+def get_custom_graph(name: str) -> CompiledStateGraph:
     """
     Returns a compiled, runnable graph for the named custom pipeline.
     Recompiles automatically if the definition file's mtime changed since
@@ -173,7 +175,7 @@ def get_custom_graph(name: str):
     return app
 
 
-def _compile(definition: PipelineDefinition):
+def _compile(definition: PipelineDefinition) -> tuple[CompiledStateGraph, Any]:
     builder = StateGraph(PipelineState)
     existing_fns = _existing_node_registry()
 
