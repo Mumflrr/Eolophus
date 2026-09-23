@@ -1,4 +1,4 @@
-import { getRun, getChat, sendChatMessage, clarifyRun, retryTruncated, cancelRun, streamUrl, excludeAttachment, includeAttachment, addAttachments, ApiError } from '../api.js';
+import { getRun, getChat, sendChatMessage, clarifyRun, retryTruncated, cancelRun, streamUrl, excludeAttachment, includeAttachment, addAttachments, deleteChatMessage, ApiError } from '../api.js';
 import { icon } from '../icons.js';
 import { emptyState, loadingRow } from '../components/card.js';
 import { fmtMs, fmtNumber, fmtRelativeTime, titleCase, escapeHtml, prettyJson, statusColor } from '../format.js';
@@ -37,6 +37,24 @@ import { setUltraAmbient } from '../ambient.js';
 // btoa() only handles Latin1, so the string is UTF-8-encoded first via
 // encodeURIComponent/unescape, the same standard workaround used
 // elsewhere for btoa + non-ASCII content.
+// Code blocks taller than this many lines get an "is-long" flag (see
+// renderMarkdown): they render clipped to a ~260px preview with a "Show
+// all N lines" toggle instead of an inner scrollbar (which would trap the
+// mouse wheel). 260px / (12px * 1.5) is ~14 lines, so anything past 22 is
+// clearly worth collapsing. The preview height itself lives in
+// chat-drawer.css (.chat-code-block-wrap.is-long).
+const LONG_CODE_LINES = 22;
+
+// Small non-crypto string hash (djb2) -> base36. Only used to give each
+// code block a stable identity across re-renders; collisions between two
+// different blocks in one conversation are vanishingly unlikely and
+// would only mean two blocks share an expanded/collapsed state.
+function _codeKey(str) {
+  let h = 5381;
+  for (let i = 0; i < str.length; i++) h = ((h << 5) + h + str.charCodeAt(i)) | 0;
+  return (h >>> 0).toString(36) + ':' + str.length;
+}
+
 function _b64EncodeUtf8(str) {
   try {
     return btoa(unescape(encodeURIComponent(str)));
@@ -59,18 +77,38 @@ function renderMarkdown(raw) {
   // This avoids changing renderMarkdown's return type (still a plain
   // string), so the other two call sites need no changes.
   const codeBlocks = [];
-  let text = String(raw).replace(/```([a-zA-Z0-9_+-]*)\n?([\s\S]*?)```/g, (_, lang, code) => {
+  let text = String(raw).replace(/```([a-zA-Z0-9_+-]*)\r?\n?([\s\S]*?)```/g, (_, lang, code) => {
     const idx = codeBlocks.length;
-    const cleanCode = code.replace(/\n$/, '');
+    const cleanCode = code.replace(/\r?\n$/, '');
     const rawB64 = _b64EncodeUtf8(cleanCode);
+    // Header strip: language label (left) + copy button (right). Blocks
+    // with no language tag still get the strip, labelled "code", so every
+    // fenced block reads as the same kind of object. Lines beyond
+    // LONG_CODE_LINES get the .is-long class: clipped to a preview with a
+    // bottom fade and a "Show all N lines" toggle (see chat-drawer.css).
+    const langLabel = lang ? escapeHtml(lang) : 'code';
+    const lineCount = cleanCode.split('\n').length;
+    const longClass = lineCount > LONG_CODE_LINES ? ' is-long' : '';
+    const codeKey = _codeKey(cleanCode);
+    const openClass = longClass && openCodeBlocks.has(codeKey) ? ' is-open' : '';
     codeBlocks.push(
-      `<div class="chat-code-block-wrap">` +
-        `<button type="button" class="btn-icon chat-code-copy-btn" data-code-copy-b64="${rawB64}" title="Copy code">⧉</button>` +
+      `<div class="chat-code-block-wrap${longClass}${openClass}" data-code-key="${codeKey}">` +
+        `<div class="chat-code-head">` +
+          `<span class="chat-code-lang">${langLabel}</span>` +
+          `<button type="button" class="chat-action-btn chat-code-copy-btn" data-code-copy-b64="${rawB64}" title="Copy code">⧉</button>` +
+        `</div>` +
         `<pre class="chat-code-block"><code${lang ? ` class="lang-${escapeHtml(lang)}"` : ''}>${escapeHtml(cleanCode)}</code></pre>` +
+        (longClass
+          ? `<button type="button" class="chat-code-more" data-code-more data-lines="${lineCount}">${openClass ? 'Show less ▴' : `Show all ${lineCount} lines ▾`}</button>`
+          : '') +
       `</div>`
     );
     return `\u0000CODEBLOCK${idx}\u0000`;
   });
+
+  // Normalise Windows line endings for the prose only — done after the
+  // fenced blocks were pulled out, so a copied code block stays byte-exact.
+  text = text.replace(/\r\n?/g, '\n');
 
   // Escape everything else now — all subsequent replacements operate on
   // already-safe text and only ever ADD the specific tags below.
@@ -108,9 +146,27 @@ function renderMarkdown(raw) {
     return `<ul>${items}</ul>\n`;
   });
 
-  // Remaining single newlines -> <br>, so plain paragraphs still wrap
-  // visually without requiring the model to emit <p> or blank-line pairs.
-  text = text.replace(/\n/g, '<br>');
+  // Block assembly. Headings, lists and code panels are block-level, so
+  // they must not have <br>s stuck to them. The old approach turned every
+  // "\n" into <br>, which meant "## Title\n\n```code```" became
+  // <h2>..</h2><br><br><div..> — two blank lines of dead space around every
+  // heading and code panel, stacked on top of those elements' own margins.
+  //
+  // Now: put each block in its own blank-line-separated chunk, split on
+  // blank lines, wrap prose chunks in <p> (a single newline INSIDE a
+  // paragraph is still a <br>, so soft-wrapped model output looks the
+  // same), and leave block chunks bare. All vertical spacing is then plain
+  // CSS margin — see .chat-markdown in chat-drawer.css.
+  text = text.replace(/\n*(<h[1-3]>|<ul>|\u0000CODEBLOCK\d+\u0000)/g, '\n\n$1');
+  text = text.replace(/(<\/h[1-3]>|<\/ul>|\u0000CODEBLOCK\d+\u0000)\n*/g, '$1\n\n');
+  text = text.replace(/^[ \t]+$/gm, ''); // whitespace-only lines count as blank
+  const blockOnly = /^(?:<h[1-3]>[^\n]*<\/h[1-3]>|<ul>[\s\S]*<\/ul>|\u0000CODEBLOCK\d+\u0000)$/;
+  text = text
+    .split(/\n{2,}/)
+    .map((chunk) => chunk.replace(/^\n+|\n+$/g, ''))
+    .filter(Boolean)
+    .map((chunk) => (blockOnly.test(chunk) ? chunk : `<p>${chunk.replace(/\n/g, '<br>')}</p>`))
+    .join('');
 
   // Restore code spans and blocks last, so their contents (which may
   // themselves contain characters that look like the patterns above,
@@ -185,6 +241,7 @@ let chat = { messages: [], loaded: false };
 let drawerExpanded = false;
 let chatSending = false;
 let openDetailSeq = null; // seq of the message whose detail panel is open, or null
+let confirmingDeleteSeq = null; // seq awaiting delete confirmation, or null (mirrors lessons.js's confirmingDelete)
 let chatReplan = false;   // explicit toggle — see api.js sendChatMessage comment
 // Per-turn profile override, mirroring runs.js's profile segmented
 // control. '' = auto. Only sent when chatReplan is on — see the
@@ -212,6 +269,11 @@ let chatUseSearch = false;
 // there's nothing for this to apply to.
 let chatHumanInTheLoop = true;
 let lessonPollTimer = null;
+// Long code blocks the user has expanded, keyed by a hash of the block's
+// own source (see _codeKey). Keyed by content rather than DOM position so
+// the choice survives renderChat() rebuilding body.innerHTML (new message
+// arrives, drawer toggles, etc.). Cleared on mount() for a new run.
+let openCodeBlocks = new Set();
 let chatLoadSeq = 0;      // guards against out-of-order loadChat() responses —
                            // see loadChat() below
 let lastChatFingerprint = null; // last chat.messages payload we actually rendered —
@@ -284,6 +346,7 @@ export function mount(el, { runUuid: uuid }) {
   drawerTransitioning = false;
   drawerJustExpandedAt = 0;
   openArtifacts = new Set();
+  openCodeBlocks = new Set();
   selectedIteration = {};
   attachmentActionPending = null;
   attachmentUploadPending = false;
@@ -772,40 +835,53 @@ const DRAWER_SETTLE_MS = 500;
 function onDrawerWheel(e) {
   const body = e.currentTarget;
 
-  // This element owns its own scroll entirely — never let a wheel event
-  // over it fall through to scrolling the page. overscroll-behavior:
-  // contain (in chat-drawer.css) covers the case where the body has
-  // scrollable content and hits its own top/bottom; this preventDefault
-  // is the backstop for the collapsed state, where the body may have no
-  // internal scroll room at all for "contain" to hook into. Since this
-  // blocks the browser's native wheel-scroll too, we apply the delta to
-  // scrollTop ourselves for the normal in-bounds case below.
-  e.preventDefault();
+  // Ignore pinch-zoom (ctrl+wheel) and horizontal-dominant gestures —
+  // those should never toggle the drawer or be swallowed.
+  if (e.ctrlKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) return;
 
-  if (drawerTransitioning) return;
-
-  // Scrolling DOWN while collapsed expands — matches the intuitive
-  // direction for a bottom-anchored drawer (scroll toward it to reveal
-  // more), flipped from the original "natural scroll" mapping.
-  if (!drawerExpanded && e.deltaY > 0) {
-    drawerExpanded = true;
-    drawerJustExpandedAt = performance.now();
-    beginDrawerTransition();
-    renderChat();
+  // Collapsed: the body has no scroll room, so this is purely a gesture
+  // to open the drawer. Swallow it (so the page doesn't scroll instead)
+  // and expand.
+  if (!drawerExpanded) {
+    if (e.deltaY > 0) {
+      e.preventDefault();
+      if (drawerTransitioning) return;
+      drawerExpanded = true;
+      drawerJustExpandedAt = performance.now();
+      beginDrawerTransition();
+      renderChat();
+    }
     return;
   }
 
-  // Scrolling UP while already at the top of the expanded, fully-
-  // scrolled-up drawer collapses it back.
+  // Expanded from here on.
+  //
+  // WHY THIS NO LONGER CALLS preventDefault() ON EVERY EVENT: the old
+  // handler blocked native scrolling for the whole drawer and re-applied
+  // `body.scrollTop += e.deltaY` by hand. That discards everything the
+  // browser does for free — momentum/inertia, smooth-scroll, OS scroll
+  // speed settings — and it mis-handled deltaMode: a classic mouse wheel
+  // (or Firefox) reports deltaMode 1 (LINES), so deltaY is ~3 per notch
+  // and each notch moved the content ~3px. That was the "gummy, short
+  // scrolls" feel. Now the browser scrolls the body natively, and
+  // `overscroll-behavior: contain` (in chat-drawer.css) stops the page
+  // from chaining once the body hits an
+  // edge. We only step in for the one case native scroll can't express:
+  // an upward gesture at the very top collapses the drawer.
+  const atTop = body.scrollTop <= 0;
   const justExpanded = performance.now() - drawerJustExpandedAt < DRAWER_SETTLE_MS;
-  if (drawerExpanded && e.deltaY < 0 && body.scrollTop <= 0 && !justExpanded) {
+
+  if (e.deltaY < 0 && atTop) {
+    // Nothing above to scroll to — either collapse, or (during the settle
+    // window / transition) just swallow so the page doesn't move.
+    e.preventDefault();
+    if (drawerTransitioning || justExpanded) return;
     drawerExpanded = false;
     beginDrawerTransition();
     renderChat();
-    return;
   }
-
-  body.scrollTop += e.deltaY;
+  // Every other case (scrolling down, or up with room left): do nothing
+  // and let the browser handle it natively.
 }
 
 function renderStatusBadge() {
@@ -1459,6 +1535,7 @@ function renderChat() {
     chat.loaded,
     drawerExpanded,
     openDetailSeq,
+    confirmingDeleteSeq,
     visible.map((m) => [m.seq, m.content, (m.lessons_used || []).length]),
   ]);
   const contentChanged = fingerprint !== lastChatFingerprint;
@@ -1475,6 +1552,7 @@ function renderChat() {
     body.innerHTML = visible
       .map((m) => chatBubble(m, _triggeringUserSeq(msgs, msgs.indexOf(m))))
       .join('');
+    wireChatMessageDeletion();
     body.querySelectorAll('[data-msg-seq]').forEach((el) => {
       el.addEventListener('click', () => {
         const seq = Number(el.dataset.msgSeq);
@@ -1490,6 +1568,9 @@ function renderChat() {
         if (msg) copyToClipboard(msg.content, btn);
       });
     });
+    // Per-message delete — see wireChatMessageDeletion() below for the
+    // ask/cancel/confirm handlers; kept in its own function since it also
+    // has to re-run after a confirm-state toggle triggers a fresh render.
     // Per-code-block copy buttons (see renderMarkdown) — each button
     // carries its own block's raw source as base64 in data-code-copy-b64,
     // so no lookup against message content/seq is needed here at all.
@@ -1503,6 +1584,27 @@ function renderChat() {
           code = '';
         }
         if (code) copyToClipboard(code, btn);
+      });
+    });
+    // Clicks anywhere on the toolbar (its label/padding, not just the
+    // buttons, which stop propagation themselves) must not expand the card.
+    body.querySelectorAll('.chat-actions').forEach((el) => {
+      el.addEventListener('click', (e) => e.stopPropagation());
+    });
+    // Expand/collapse for long code blocks. Toggles the class on the live
+    // DOM (no renderChat() — that would replay fade-ins and jump scroll)
+    // and records the choice in openCodeBlocks so it survives the next
+    // rebuild. stopPropagation for the same reason as the copy button:
+    // the surrounding card is itself click-to-expand.
+    body.querySelectorAll('[data-code-more]').forEach((btn) => {
+      btn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        const wrap = btn.closest('.chat-code-block-wrap');
+        if (!wrap) return;
+        const key = wrap.dataset.codeKey;
+        const nowOpen = wrap.classList.toggle('is-open');
+        if (nowOpen) openCodeBlocks.add(key); else openCodeBlocks.delete(key);
+        btn.textContent = nowOpen ? 'Show less ▴' : `Show all ${btn.dataset.lines} lines ▾`;
       });
     });
   }
@@ -1558,6 +1660,30 @@ function _triggeringUserSeq(allMsgs, assistantIdx) {
   return null;
 }
 
+// Hover toolbar for an assistant card (copy + delete), pinned to the
+// card's top-right corner — see .chat-actions in chat-drawer.css. Delete
+// confirmation swaps into the SAME toolbar (and keeps it visible) rather
+// than a separate row, so it works whether or not the card's detail panel
+// is open. The data-* attribute names are what wireChatMessageDeletion()
+// and renderChat()'s copy wiring key off — don't rename them.
+function messageActions(seq, confirming) {
+  if (confirming) {
+    return `
+      <div class="chat-actions">
+        <span class="chat-actions-label">Delete this message?</span>
+        <button type="button" class="chat-action-btn" data-cancel-delete-msg="${seq}" title="Cancel" aria-label="Cancel">${icon('x')}</button>
+        <button type="button" class="chat-action-btn chat-action-btn--confirm" data-confirm-delete-msg="${seq}">Delete</button>
+      </div>
+    `;
+  }
+  return `
+    <div class="chat-actions">
+      <button type="button" class="chat-action-btn" data-copy-seq="${seq}" title="Copy message" aria-label="Copy message">⧉</button>
+      <button type="button" class="chat-action-btn" data-ask-delete-msg="${seq}" title="Delete message" aria-label="Delete message">${icon('trash')}</button>
+    </div>
+  `;
+}
+
 function chatBubble(m, triggeringUserSeq) {
   if (m.role === 'system') {
     return `
@@ -1569,12 +1695,20 @@ function chatBubble(m, triggeringUserSeq) {
   }
 
   if (m.role === 'user') {
+    const confirming = confirmingDeleteSeq === m.seq;
     return `
       <div class="chat-bubble-row user">
         <div class="chat-bubble user">
           <div class="chat-bubble-content">${escapeHtml(m.content)}</div>
-          <div class="chat-bubble-time">${fmtRelativeTime(m.created_at)}</div>
+          ${confirming ? `
+            <div class="chat-bubble-time" style="display:flex;align-items:center;gap:8px;">
+              <span>Delete this message?</span>
+              <button type="button" class="btn-pill grey btn-sm" data-cancel-delete-msg="${m.seq}">Cancel</button>
+              <button type="button" class="btn-pill red btn-sm" data-confirm-delete-msg="${m.seq}">${icon('trash')} Confirm</button>
+            </div>
+          ` : `<div class="chat-bubble-time">${fmtRelativeTime(m.created_at)}</div>`}
         </div>
+        ${confirming ? '' : `<button type="button" class="chat-action-btn chat-action-btn--user" data-ask-delete-msg="${m.seq}" title="Delete message" aria-label="Delete message">${icon('trash')}</button>`}
       </div>
     `;
   }
@@ -1621,7 +1755,7 @@ function chatBubble(m, triggeringUserSeq) {
 
   return `
     <div class="chat-bubble-row assistant">
-      <div class="chat-card ${hasDetail ? 'clickable' : ''} ${isOpen ? 'open' : ''}" ${hasDetail ? `data-msg-seq="${m.seq}"` : ''}>
+      <div class="chat-card ${hasDetail ? 'clickable' : ''} ${isOpen ? 'open' : ''} ${confirmingDeleteSeq === m.seq ? 'is-confirming' : ''}" ${hasDetail ? `data-msg-seq="${m.seq}"` : ''}>
         ${m.node_id ? `
           <div class="chat-card-head">
             <span class="node-pill node-${escapeHtml(m.node_id)}">${icon(NODE_ICON[m.node_id] || 'info')}${escapeHtml(titleCase(m.node_id))}</span>
@@ -1634,7 +1768,7 @@ function chatBubble(m, triggeringUserSeq) {
             ${renderMarkdown(m.content)}
           </div>
         `}
-        <button type="button" class="btn-icon chat-copy-btn chat-copy-btn--floating" data-copy-seq="${m.seq}" title="Copy message">⧉</button>
+        ${messageActions(m.seq, confirmingDeleteSeq === m.seq)}
         ${lessonsUsed.length ? `
           <div class="tag-row" style="margin-top:8px;">
             <span class="badge purple" title="Lessons injected into this turn's prompt">${icon('book')} ${lessonsUsed.length} lesson${lessonsUsed.length === 1 ? '' : 's'} used</span>
@@ -1664,6 +1798,48 @@ function chatBubble(m, triggeringUserSeq) {
       </div>
     </div>
   `;
+}
+
+// Ask/cancel/confirm handlers for the per-message delete button (see the
+// data-ask-delete-msg/-cancel-delete-msg/-confirm-delete-msg markup in
+// chatBubble). Mirrors lessons.js's wireLessonActions — same inline
+// ask-then-confirm pattern, kept as its own function because renderChat's
+// contentChanged short-circuit means this has to be re-wired every time
+// the chat body's innerHTML is actually rebuilt, not just on first mount.
+function wireChatMessageDeletion() {
+  const body = document.getElementById('chat-drawer-body');
+  if (!body) return;
+  body.querySelectorAll('[data-ask-delete-msg]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      confirmingDeleteSeq = Number(btn.dataset.askDeleteMsg);
+      renderChat();
+    });
+  });
+  body.querySelectorAll('[data-cancel-delete-msg]').forEach((btn) => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      confirmingDeleteSeq = null;
+      renderChat();
+    });
+  });
+  body.querySelectorAll('[data-confirm-delete-msg]').forEach((btn) => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      const seq = Number(btn.dataset.confirmDeleteMsg);
+      btn.disabled = true;
+      try {
+        await deleteChatMessage(runUuid, seq);
+        chat.messages = chat.messages.filter((m) => m.seq !== seq);
+        confirmingDeleteSeq = null;
+        toastSuccess('Message deleted.');
+        renderChat();
+      } catch (err) {
+        toastError(err instanceof ApiError ? err.message : 'Could not delete message.');
+        btn.disabled = false;
+      }
+    });
+  });
 }
 
 function lessonsUsedDetail(lessonsUsed) {

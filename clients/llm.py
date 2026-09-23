@@ -50,6 +50,65 @@ from pydantic import BaseModel
 # by having every module that needs it import the one lock defined here.
 env_lock = threading.Lock()
 
+# ── Cooperative run cancellation ─────────────────────────────────────────────
+# DELETE /run/{uuid} used to only write status="cancelled" to run.json. Nothing
+# ever told the worker thread to stop, so app_graph.invoke() kept executing
+# every remaining node — and since the executor is single-worker, any new run
+# or chat turn queued behind it (while its run.json already said "running").
+# This is the "tell it" half: the API layer calls request_cancel(); the worker
+# polls at each model-call boundary and inside the streaming loop, and raises
+# RunCancelled, which unwinds through LangGraph to the thread function.
+#
+# RunCancelled derives from BaseException, NOT Exception, on purpose: this
+# codebase has many `except Exception` blocks — including _stream_completion's
+# non-streaming fallback, which would re-issue the whole request — that would
+# otherwise swallow it.
+#
+# _active_run is process-global. That is only correct because
+# state.executor is ThreadPoolExecutor(max_workers=1). If that ever changes,
+# replace it with a ContextVar (and verify LangGraph copies context into its
+# node threads before relying on that).
+class RunCancelled(BaseException):
+    """Raised inside a pipeline worker thread once its run has been cancelled."""
+
+
+_cancelled_runs: set[str] = set()
+_active_run: Optional[str] = None
+
+
+def request_cancel(run_uuid: str) -> None:
+    """Called from the API layer (DELETE /run/{uuid}) — any thread."""
+    _cancelled_runs.add(run_uuid)
+
+
+def clear_cancel(run_uuid: str) -> None:
+    """Forget a prior cancel. Call when SUBMITTING new work for a run (e.g. a
+    chat turn on a previously-cancelled run), not when the worker starts — a
+    cancel that lands while the work is still queued must survive until begin_run."""
+    _cancelled_runs.discard(run_uuid)
+
+
+def begin_run(run_uuid: str) -> None:
+    """Called first thing in a worker thread. Aborts immediately if the run was
+    cancelled while it was still waiting in the executor queue."""
+    global _active_run
+    _active_run = run_uuid
+    check_cancelled()
+
+
+def end_run() -> None:
+    global _active_run
+    _active_run = None
+
+
+def is_cancelled() -> bool:
+    return _active_run is not None and _active_run in _cancelled_runs
+
+
+def check_cancelled() -> None:
+    if is_cancelled():
+        raise RunCancelled(_active_run)
+
 # Per-step overrides for custom pipelines (pipeline/custom_graph.py) and
 # the truncation-retry wrapper (pipeline/graph.py), which each need to run
 # ONE node call with a different model/thinking-budget/output-cap than its
@@ -742,6 +801,16 @@ def _stream_completion(
         stream = client.chat.completions.create(**create_kwargs)
 
         for chunk in stream:
+            if is_cancelled():
+                # Closing the response drops the HTTP connection, which makes
+                # llama-server abort generation (frees the GPU immediately).
+                # RunCancelled is a BaseException, so the `except Exception`
+                # non-streaming fallback below can't catch it.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                raise RunCancelled(_active_run)
             if ttft_ms == 0.0:
                 ttft_ms = (time.perf_counter() - start_ts) * 1000
 
@@ -822,6 +891,7 @@ def _prepare_call(
     budget_tokens:          Optional[int],
     output_cap_override:    Optional[int],
 ) -> _PreparedCall:
+    check_cancelled()   # don't swap models for a run that's already been cancelled
     cfg        = get_model_config(model_id)
     base_url   = cfg["base_url"]
     temp       = cfg.get("temperature", 0.6)
@@ -842,6 +912,7 @@ def _prepare_call(
         log.warning("model_manager.ensure_model_loaded failed: %s", e)
         did_load = False
     load_ms = (time.perf_counter() - load_start) * 1000
+    check_cancelled()   # cancel may have landed during the swap — skip sending the prompt
 
     if did_load:
         # Only worth reading the log for memory data when a load actually
@@ -1185,6 +1256,7 @@ def call_model_with_tools(
     rounds   = 0
 
     while True:
+        check_cancelled()
         rounds += 1
         force_final = rounds > max_tool_rounds
 
@@ -1214,6 +1286,9 @@ def call_model_with_tools(
             log.error("[%s] %s tool-call round %d failed: %s", stage, model_name, rounds, exc)
             raise
 
+        # This request is non-streaming, so a cancel that landed during it can only be
+        # noticed now — stop before executing any tool calls or issuing another round.
+        check_cancelled()
         msg = resp.choices[0].message
 
         reasoning = getattr(msg, "reasoning_content", None) or ""

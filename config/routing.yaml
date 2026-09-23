@@ -164,6 +164,7 @@ lesson_retrieval:
     difficulty:  0.1
   recency_decay_rate: 0.05
   dedup_threshold: 0.85
+  dedup_text_threshold: 0.5   # resolution_pattern word overlap also required to merge
   meta_distill_every_n_runs: 50
 
 # ── LLMLingua-2 compression ──────────────────────────────────────────────────

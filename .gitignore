@@ -46,3 +46,4 @@ Thumbs.db
 logs/
 
 *.deb
+*.patch

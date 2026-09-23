@@ -69,8 +69,23 @@ def _as_db_str(value, default: str = "auto") -> str:
 def classify_node(state: PipelineState) -> dict:
     run_dir          = state["run_dir"]
     task             = state.get("normalised_input") or state.get("raw_text_input", "")
-    pinned_mode      = state.get("mode")
-    pinned_task_type = state.get("task_type")
+    # requested_mode, NOT state.get("mode") — "mode" is this node's OWN
+    # output key (see final_mode below and this function's return dict),
+    # so reading it back as a pin has the same collision requested_task_type
+    # was introduced to avoid (see pipeline/state.py). Only run.py's CLI
+    # sets this today; the web API leaves it unset (mode is informational
+    # there — see the profile-resolution comment a few lines down).
+    pinned_mode      = state.get("requested_mode")
+    # Read from requested_task_type, NOT state.get("task_type") — the
+    # latter is classify_node's OWN output key (see this node's final
+    # return dict, "task_type": final_task_type below), so on a chat
+    # replan reusing this run's checkpoint thread, state["task_type"]
+    # holds whatever the PREVIOUS classify pass decided, not anything the
+    # caller actually pinned. requested_task_type is written only by the
+    # API layer (runs.start_run / chat's turn-state construction) from
+    # the real request field, so it can't be shadowed by this node's own
+    # prior return. See pipeline/state.py's requested_task_type docstring.
+    pinned_task_type = state.get("requested_task_type")
 
     # ── Choose system prompt and build messages ────────────────────────────
     if pinned_mode and pinned_task_type:

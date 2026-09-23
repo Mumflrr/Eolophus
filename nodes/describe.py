@@ -32,7 +32,7 @@ from clients.llm import (
     _write_thinking_log, _extract_thinking_partial,
     _log_stage_entry, _get_thinking_budget, _get_http_timeout,
     _get_output_token_cap, TruncatedOutputError, ToolCallRecord, _build_logit_bias,
-    _build_thinking_extra_body,
+    _build_thinking_extra_body, _stream_completion, check_cancelled,
 )
 from clients.tools import (
     SEARCH_HINT, SEARCH_TOOL_SCHEMA, TOOL_IMPLEMENTATIONS, format_search_notes,
@@ -136,10 +136,12 @@ def describe_node(state: dict) -> dict:
     _cap_override = _step_output_cap_override.get()
     max_tokens = _cap_override if _cap_override is not None else _get_output_token_cap("describe")
 
+    check_cancelled()   # don't swap models for a run that's already been cancelled
     try:
         ensure_model_loaded(model_id_key)
     except Exception as e:
         log.warning("model_manager failed: %s — assuming %s already running", e, model_id_key)
+    check_cancelled()   # cancel may have landed during the swap
 
     raw_client = OpenAI(
         # Previously hardcoded to timeout=300.0 — same bug as the one fixed
@@ -211,6 +213,7 @@ def describe_node(state: dict) -> dict:
                                                  # stays system+user for the prompt hash
         rounds = 0
         while True:
+            check_cancelled()
             rounds += 1
             stats["rounds"] += 1
             force_final = bool(call_tools) and rounds > _MAX_TOOL_ROUNDS
@@ -229,7 +232,27 @@ def describe_node(state: dict) -> dict:
                 create_kwargs["tools"]       = call_tools
                 create_kwargs["tool_choice"] = "none" if force_final else "auto"
 
+            if not call_tools:
+                # No tools to accumulate, so stream via the shared helper: a cancel
+                # aborts mid-generation (closing the stream makes llama-server stop)
+                # instead of waiting out a blocking request of up to `max_tokens`.
+                reasoning_sink: list = []
+                content, usage, _ttft, _think, n_chunks, finish = _stream_completion(
+                    raw_client, model_id, working_messages, create_kwargs["temperature"],
+                    top_p, extra_body, "describe", max_tokens=max_tokens,
+                    reasoning_sink=reasoning_sink, presence_penalty=presence_penalty,
+                )
+                stats["tokens_out"] += usage.completion_tokens if usage else n_chunks
+                reasoning = "".join(reasoning_sink)
+                if reasoning:
+                    stats["reasoning_chars"] += len(reasoning)
+                    _write_thinking_log(run_dir, "describe", reasoning)
+                return content, finish, usage
+
             resp  = raw_client.chat.completions.create(**create_kwargs)
+            # Non-streaming (tool-calling) request: a cancel that landed during it is
+            # noticed here, before any tool runs or another round is issued.
+            check_cancelled()
             msg   = resp.choices[0].message
             usage = resp.usage
             if usage:
@@ -374,6 +397,7 @@ def describe_node(state: dict) -> dict:
     log.info("[describe] answered in %.0fms (%d round(s), %d search call(s))",
              elapsed_ms, stats["rounds"], len(tool_history))
 
+    check_cancelled()   # don't write a final answer for a cancelled run
     output_path = str(Path(run_dir) / "final.json")
     Path(output_path).write_text(
         json.dumps({"answer": answer, "task_type": "describe"}, indent=2),

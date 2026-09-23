@@ -95,6 +95,69 @@ def format_history_for_prompt(messages: list[dict], max_chars: int = 12_000) -> 
     return text
 
 
+def find_orphaned_chats() -> list[dict]:
+    """
+    Chats whose run_uuid has no matching row in `runs` — i.e. chats that
+    outlived their run. That survival is deliberate (see this module's
+    docstring), but nothing previously surfaced WHICH chats are in that
+    state or let anyone clean them up once the history is no longer
+    wanted. Read-only; still no FK — this is one query, not a constraint.
+
+    Returns one dict per orphaned run_uuid, newest-first: message_count,
+    first_message_at, last_message_at, and a short preview of the first
+    message so an orphan is identifiable without opening it.
+    """
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            """
+            SELECT
+                c.run_uuid,
+                COUNT(*)                      AS message_count,
+                MIN(c.created_at)              AS first_message_at,
+                MAX(c.created_at)              AS last_message_at,
+                (SELECT content FROM chats c2
+                 WHERE c2.run_uuid = c.run_uuid
+                 ORDER BY c2.seq ASC LIMIT 1)   AS first_message_preview
+            FROM chats c
+            LEFT JOIN runs r ON r.run_uuid = c.run_uuid
+            WHERE r.run_uuid IS NULL
+            GROUP BY c.run_uuid
+            ORDER BY last_message_at DESC
+            """
+        ).fetchall()
+        out = []
+        for row in rows:
+            d = dict(row)
+            d["first_message_preview"] = (d.get("first_message_preview") or "")[:200]
+            out.append(d)
+        return out
+    finally:
+        conn.close()
+
+
+def delete_message(run_uuid: str, seq: int) -> bool:
+    """
+    Delete a single message from a chat by its (run_uuid, seq). Returns
+    True if a row was deleted, False if no such message existed.
+
+    Same chat-agnostic-lessons contract as delete_chat: lesson_usage rows
+    referencing this chat_seq are left alone — a lesson's usage history
+    is allowed to reference a now-deleted turn, same as it's already
+    allowed to reference a now-deleted lesson (see get_lessons_used_for_chat's
+    LEFT JOIN in lesson_store.py).
+    """
+    conn = get_conn()
+    try:
+        cur = conn.execute("DELETE FROM chats WHERE run_uuid = ? AND seq = ?", (run_uuid, seq))
+        conn.commit()
+        existed = cur.rowcount > 0
+        log.debug("Chat message delete: run=%s seq=%d existed=%s", run_uuid, seq, existed)
+        return existed
+    finally:
+        conn.close()
+
+
 def delete_chat(run_uuid: str) -> int:
     """
     Delete all messages for a chat. Does NOT touch lessons or

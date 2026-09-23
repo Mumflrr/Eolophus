@@ -558,23 +558,9 @@ def _run_chat_replan(
         "use_search":        use_search,
         "human_in_the_loop": human_in_the_loop,
     }
-    # ALWAYS assigned (never a bare `if cond: turn_state[key] = ...` that
-    # skips the key entirely on a falsy value) — this run's thread_id is
-    # REUSED across chat turns, and LangGraph's checkpoint merge treats an
-    # OMITTED key as "leave whatever's already checkpointed," not "clear
-    # it" (confirmed empirically against langgraph.checkpoint.sqlite: a
-    # node/invoke that doesn't mention a key at all leaves the prior
-    # turn's value sitting there; only an EXPLICIT None actually
-    # overwrites it). A conditional assignment here would let turn N's
-    # explicit pin silently keep applying to turn N+1's plain follow-up
-    # that pinned nothing — exactly the search_notes leak this file's own
-    # plan_node comment already warns about for a different field, and
-    # the same class of bug this fixes for requested_task_type. Both
-    # classify_node's `state.get("requested_profile") or "auto"` and its
-    # `state.get("requested_task_type")` (see pipeline/state.py's
-    # requested_task_type docstring) already treat None as "no pin," so
-    # writing None here to clear a stale pin needs no change on that end.
-    turn_state["requested_profile"]   = requested_profile if (requested_profile and requested_profile != "auto") else None
-    turn_state["requested_task_type"] = task_type_override or None
+    if requested_profile and requested_profile != "auto":
+        turn_state["requested_profile"] = requested_profile
+    if task_type_override:
+        turn_state["task_type"] = task_type_override
 
     return app_graph.invoke(cast(PipelineState, turn_state), config=config)

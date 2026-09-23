@@ -9,8 +9,10 @@ Prompt lives in config/prompts/distiller.yaml.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
+from pathlib import Path
 from typing import Any, Optional
 from pydantic import BaseModel, Field
 
@@ -37,6 +39,35 @@ class DistilledLesson(BaseModel):
     )
 
 
+def _load_failure_history(run_dir: str) -> list[dict]:
+    """
+    The non-pass verdicts from earlier correction-loop iterations, oldest first.
+
+    distiller_node only runs its LLM call when the FINAL verdict is a pass — and a
+    pass verdict says nothing about what went wrong. The failing verdicts are
+    snapshotted by clients.llm.write_iteration_artifact under
+    <run_dir>/iterations/<n>/verdict.json (run_dir is the turn dir for a chat turn).
+    """
+    base = Path(run_dir) / "iterations"
+    if not base.is_dir():
+        return []
+    dirs = sorted((p for p in base.iterdir() if p.is_dir() and p.name.isdigit()),
+                  key=lambda p: int(p.name))
+    failed: list[dict] = []
+    for d in dirs:
+        try:
+            v = json.loads((d / "verdict.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(v, dict) and v.get("category") not in (None, "pass"):
+            failed.append({**v, "loop_iteration": int(d.name)})
+    return failed
+
+
+def _format_failure_history(failed: list[dict], max_chars: int = 3000) -> str:
+    return json.dumps(failed, indent=2, default=str)[:max_chars]
+
+
 def distiller_node(state: PipelineState) -> dict:
     """
     Look at the run history. If we iterated and succeeded, extract a lesson.
@@ -55,6 +86,18 @@ def distiller_node(state: PipelineState) -> dict:
 
     task_type: str = state.get("task_type") or "coding"
 
+    # A lesson needs a problem to learn from — see _load_failure_history. Without
+    # any failing-verdict snapshot the model only sees a passing verdict, so the
+    # call can't produce anything meaningful; skip it (also covers a run whose
+    # iteration counter is > 0 without there ever having been a failure).
+    failed_verdicts = _load_failure_history(state["run_dir"])
+    if not failed_verdicts:
+        log.info(
+            "Distiller skipped: iteration=%d but no failing-verdict snapshots under %s/iterations",
+            iteration, state["run_dir"],
+        )
+        return {"pipeline_complete": state.get("pipeline_complete", True)}
+
     profile = state.get("profile") or state.get("requested_profile")
     current_model_override = (state.get("escalated_models") or {}).get("distiller")
 
@@ -63,6 +106,7 @@ def distiller_node(state: PipelineState) -> dict:
         template_vars   = {
             "iteration":   str(iteration),
             "verdict_json": verdict.model_dump_json(indent=2),
+            "failed_verdicts_json": _format_failure_history(failed_verdicts),
         },
         response_schema = DistilledLesson,
         stage           = "distill",
@@ -74,7 +118,10 @@ def distiller_node(state: PipelineState) -> dict:
 
     if lesson_output.is_valuable and lesson_output.lesson_text:
         log.info("Distilled lesson: %s", lesson_output.lesson_text)
-        _save_lesson(state, task_type, lesson_output.lesson_text)
+        _save_lesson(
+            state, task_type, lesson_output.lesson_text,
+            failure_summary=str(failed_verdicts[0].get("description") or ""),
+        )
     else:
         log.debug("Distiller: fix was not universally valuable — skipping")
 
@@ -128,6 +175,7 @@ def _save_lesson(
     lesson_text:        str,
     issue_category_override: Optional[str] = None,
     source_chat_seq:    Optional[int]      = None,
+    failure_summary:    Optional[str]      = None,
 ) -> None:
     """
     Construct a full Lesson object and write it to the lesson store.
@@ -171,9 +219,12 @@ def _save_lesson(
         # critic referenced it while explaining an issue. Scrub known
         # attachment filenames out of the summary as a defense-in-depth
         # measure; this is belt-and-suspenders, not the primary guarantee.
+        # Prefer the first FAILING verdict's description (the actual problem); the
+        # final verdict is a pass, whose description doesn't describe an issue.
         issue_summary = (
-            verdict.description[:200] if verdict and verdict.description
-            else "Pipeline required correction iterations before passing."
+            (failure_summary or "")[:200]
+            or (verdict.description[:200] if verdict and verdict.description else "")
+            or "Pipeline required correction iterations before passing."
         )
         issue_summary = _scrub_attachment_references(issue_summary, state.get("attachments") or [])
 
@@ -186,17 +237,25 @@ def _save_lesson(
             task_type          = task_type,
             tags               = list(set(tags)),
             model_caught       = model_caught,
-            issue_category     = str(issue_category),
+            # Enum members must go through .value — str(Enum.member) is 'Cls.member'.
+            issue_category     = str(getattr(issue_category, "value", issue_category)),
             confidence_score   = 1.0,
             times_seen         = 1,
         )
 
-        write_lesson(lesson)
+        # write_lesson returns the uuid of the row it wrote OR, when it dedups,
+        # of the EXISTING row it merged into. Previously that was ignored and
+        # "written" was logged with the new (never-inserted) uuid either way.
+        stored_uuid = write_lesson(lesson)
+        merged = stored_uuid != lesson.lesson_uuid
 
-        if source_chat_seq is not None:
+        if source_chat_seq is not None and not merged:
             _set_source_chat_seq(lesson.lesson_uuid, source_chat_seq)
 
-        log.info("Lesson written to store: %s", lesson.lesson_uuid[:8])
+        if merged:
+            log.info("Lesson merged into existing %s (near-duplicate) — no new row", stored_uuid[:8])
+        else:
+            log.info("Lesson written to store: %s", lesson.lesson_uuid[:8])
 
     except Exception as e:
         log.warning("Failed to write lesson to store: %s", e)

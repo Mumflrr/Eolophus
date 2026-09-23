@@ -331,13 +331,7 @@ async def start_run(req: RunRequest):
         if req.requested_profile and req.requested_profile != "auto":
             initial_state["requested_profile"] = req.requested_profile
         if req.task_type:
-            # requested_task_type, NOT "task_type" — classify_node returns
-            # "task_type" as ITS OWN output on every call, so writing the
-            # caller's pin under that same key would be indistinguishable
-            # from classify_node's prior output the moment this thread is
-            # ever re-invoked (chat replan). See pipeline/state.py's
-            # requested_task_type docstring.
-            initial_state["requested_task_type"] = req.task_type
+            initial_state["task_type"] = req.task_type
 
     # Write initial run.json immediately so the UI can poll it. profile
     # isn't known yet (classify_node hasn't run) — only mode was ever
