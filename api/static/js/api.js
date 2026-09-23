@@ -112,6 +112,16 @@ export const getChat = (runUuid) => request(`/chat/${runUuid}`);
 // section). Does not touch the run itself or any distilled lessons.
 // 409s if the run is still busy — same as sendChatMessage.
 export const deleteChat = (runUuid) => request(`/chat/${runUuid}`, { method: 'DELETE' });
+// Deletes a single chat message (and its per-turn artifact directory) by
+// seq — the fine-grained counterpart to deleteChat, which wipes the whole
+// conversation at once. Lessons/lesson_usage survive either way (see
+// storage/chat_store.py's delete_message).
+export const deleteChatMessage = (runUuid, seq) =>
+  request(`/chat/${runUuid}/${seq}`, { method: 'DELETE' });
+// Chats whose run has already been hard-deleted (see storage/chat_store.py's
+// find_orphaned_chats) — surfaced for cleanup, not part of normal run flow.
+export const listOrphanedChats = () => request('/chats/orphaned');
+export const deleteOrphanedChats = () => request('/chats/orphaned', { method: 'DELETE' });
 // replan=false (default): lighter follow-up, reuses this run's already-
 // established classification/plan. replan=true: full re-plan from
 // classify, as if task_type/profile could change based on the new message.

@@ -22,6 +22,8 @@ import time
 from pathlib import Path
 
 from clients.llm import call_role, write_iteration_artifact
+from config.loader import get_routing_config
+from nodes._shared import record_escalation
 from pipeline.state import PipelineState
 from schemas.validation import (
     CritiqueRecord, CritiqueVerdict, ValidationVerdict,
@@ -75,20 +77,7 @@ def synthesise_node(state: PipelineState) -> dict:
         current_model_override = current_model_override,
     )
 
-    escalated_models   = dict(state.get("escalated_models") or {})
-    escalation_history = list(state.get("escalation_history") or [])
-    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(verdict, "_escalated_from", None)
-        escalated_models[role] = escalated_to_attr
-        escalation_history.append({
-            "stage":      role,
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "truncation",   # ValidationVerdict has no confidence field
-            "iteration":  iteration,
-        })
-        log.info("Synthesise (%s) escalated %s → %s", role, escalated_from_attr, escalated_to_attr)
+    escalated_models, escalation_history = record_escalation(state, role, verdict)
 
     elapsed = (time.perf_counter() - start) * 1000
     verdict = verdict.model_copy(update={
@@ -167,20 +156,7 @@ def validate_node(state: PipelineState) -> dict:
         current_model_override = current_model_override,
     )
 
-    escalated_models   = dict(state.get("escalated_models") or {})
-    escalation_history = list(state.get("escalation_history") or [])
-    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(verdict, "_escalated_from", None)
-        escalated_models["validate"] = escalated_to_attr
-        escalation_history.append({
-            "stage":      "validate",
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "truncation",
-            "iteration":  state.get("iteration", 0),
-        })
-        log.info("Validate escalated %s → %s", escalated_from_attr, escalated_to_attr)
+    escalated_models, escalation_history = record_escalation(state, "validate", verdict)
 
     current_iteration = state.get("iteration", 0)
     new_iteration     = current_iteration + 1
@@ -257,11 +233,7 @@ def final_validate_node(state: PipelineState) -> dict:
             })
 
     # Escalate to 35B if assembled project is large
-    import yaml
-    cfg_path  = Path(__file__).parent.parent / "config" / "routing.yaml"
-    with open(cfg_path) as f:
-        routing = yaml.safe_load(f)
-    threshold = routing.get("final_validation", {}).get(
+    threshold = get_routing_config().get("final_validation", {}).get(
         "escalate_to_35b_token_threshold", 12000
     )
     total_chars = sum(len(o["code"]) for o in sub_outputs)
@@ -293,20 +265,7 @@ def final_validate_node(state: PipelineState) -> dict:
         current_model_override = current_model_override,
     )
 
-    escalated_models   = dict(state.get("escalated_models") or {})
-    escalation_history = list(state.get("escalation_history") or [])
-    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(verdict, "_escalated_from", None)
-        escalated_models[role] = escalated_to_attr
-        escalation_history.append({
-            "stage":      role,
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "truncation",
-            "iteration":  state.get("iteration", 0),
-        })
-        log.info("Final validate (%s) escalated %s → %s", role, escalated_from_attr, escalated_to_attr)
+    escalated_models, escalation_history = record_escalation(state, role, verdict)
 
     log.info(
         "Final validation: %s | compat=%s | components=%d",

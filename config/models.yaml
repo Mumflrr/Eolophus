@@ -24,6 +24,18 @@ models:
       default_on: false
     temperature: 0.6
     top_p:       0.95
+    # Mirrors 35b's value below — was previously unset on every model,
+    # including 35b, because no call site actually read this key (see
+    # clients/llm.py's _prepare_call/presence_penalty and describe.py's
+    # "Request shape" comment). Added here after a describe_node run on
+    # this model degenerated into repeating "|" for 32,000 tokens straight
+    # (a content-repetition loop — distinct from the <think>-tag self-doubt
+    # loop NoWait suppression already guards against). 1.0 is a starting
+    # value, not a verified-optimal one — worth tuning against this
+    # model's own output if it turns out to suppress legitimate repeated
+    # structure (e.g. a genuinely repetitive ASCII pattern that's supposed
+    # to repeat, or repeated code tokens like closing brackets).
+    presence_penalty: 1.0
 
   # ── Qwen3.6-35B MoE UD-Q4_K_M (unsloth) ───────────────────────────────
   35b:
@@ -202,7 +214,6 @@ escalation_ladders:
   validate:            ["35b"]
   final_validate:      ["35b"]
   describe:            ["35b"]
-  distill:             ["35b"]
   distiller:           ["35b"]
   # search_query, gatekeeper, chess_fast, chess_slow: no entry — cheap by
   # design, not escalated even once 35b or a future model exists (a 3-8

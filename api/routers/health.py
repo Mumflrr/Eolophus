@@ -17,9 +17,9 @@ router = APIRouter()
 async def health():
     """Server health, active model, and queue status."""
     from clients.model_manager import current_model
-    from clients.llm import _load_config
+    from config.loader import get_models_config
 
-    cfg    = _load_config()
+    cfg    = get_models_config()
     hot    = current_model()
     hot_cfg = cfg["models"].get(hot, {}) if hot else {}
 

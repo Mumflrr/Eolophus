@@ -14,9 +14,12 @@ from __future__ import annotations
 import logging
 import os
 
+from langchain_core.runnables import RunnableConfig
+
 from fastapi import APIRouter, HTTPException
 
 from api import state
+from clients.llm import RunCancelled, begin_run, clear_cancel, end_run
 from api.json_utils import read_json, write_run_json
 from api.paths import active_sentinel_dir, get_run_dir
 from api.schemas import ClarifyRequest, RetryTruncatedRequest
@@ -128,10 +131,11 @@ async def clarify_run(run_uuid: str, req: ClarifyRequest):
                 os.environ[k] = v
 
         try:
+            begin_run(run_uuid)   # raises RunCancelled if cancelled while still queued
             from pipeline.graph import get_graph
             from langgraph.types import Command
             app_graph, callbacks = get_graph()
-            config = {"configurable": {"thread_id": run_uuid}}
+            config: RunnableConfig = {"configurable": {"thread_id": run_uuid}}
             if callbacks:
                 config["callbacks"] = callbacks
 
@@ -182,6 +186,11 @@ async def clarify_run(run_uuid: str, req: ClarifyRequest):
 
             return final_state
 
+        except RunCancelled:
+            # DELETE /run/{uuid} already wrote status="cancelled"; nothing to overwrite.
+            log.info("Resume on run %s cancelled — worker thread exited early", run_uuid)
+            return {}
+
         except Exception as exc:
             log.exception("Resume (clarify) on run %s failed with an uncaught exception", run_uuid)
             write_run_json(
@@ -201,6 +210,7 @@ async def clarify_run(run_uuid: str, req: ClarifyRequest):
             raise
 
         finally:
+            end_run()
             with state.env_lock:
                 for k, v in saved.items():
                     if v is None:
@@ -208,6 +218,7 @@ async def clarify_run(run_uuid: str, req: ClarifyRequest):
                     else:
                         os.environ[k] = v
 
+    clear_cancel(run_uuid)   # a previous cancel of this run must not abort the resume
     future = state.executor.submit(_resume)
     state.active_runs[run_uuid] = {
         "future":        future,
@@ -303,10 +314,11 @@ async def retry_truncated(run_uuid: str, req: RetryTruncatedRequest):
                 os.environ[k] = v
 
         try:
+            begin_run(run_uuid)   # raises RunCancelled if cancelled while still queued
             from pipeline.graph import get_graph
             from langgraph.types import Command
             app_graph, callbacks = get_graph()
-            config = {"configurable": {"thread_id": run_uuid}}
+            config: RunnableConfig = {"configurable": {"thread_id": run_uuid}}
             if callbacks:
                 config["callbacks"] = callbacks
 
@@ -357,6 +369,11 @@ async def retry_truncated(run_uuid: str, req: RetryTruncatedRequest):
 
             return final_state
 
+        except RunCancelled:
+            # DELETE /run/{uuid} already wrote status="cancelled"; nothing to overwrite.
+            log.info("Resume on run %s cancelled — worker thread exited early", run_uuid)
+            return {}
+
         except Exception as exc:
             log.exception("Retry-truncated on run %s failed with an uncaught exception", run_uuid)
             write_run_json(
@@ -376,6 +393,7 @@ async def retry_truncated(run_uuid: str, req: RetryTruncatedRequest):
             raise
 
         finally:
+            end_run()
             with state.env_lock:
                 for k, v in saved.items():
                     if v is None:
@@ -383,6 +401,7 @@ async def retry_truncated(run_uuid: str, req: RetryTruncatedRequest):
                     else:
                         os.environ[k] = v
 
+    clear_cancel(run_uuid)   # a previous cancel of this run must not abort the resume
     future = state.executor.submit(_resume)
     state.active_runs[run_uuid] = {
         "future":        future,

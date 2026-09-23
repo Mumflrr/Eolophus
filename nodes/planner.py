@@ -35,6 +35,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
+from typing import Optional
 
 from clients.llm import call_role, compress_text, TruncatedOutputError, EscalationNeeded
 from clients.tools import (
@@ -45,12 +46,6 @@ from schemas.plan_spec import PlanSpec
 from schemas.lesson import LessonQuery
 from storage.lesson_store import retrieve_lessons, format_lessons_for_prompt
 
-
-def _get_budget(stage: str) -> int:
-    from clients.llm import _get_thinking_budget
-    return _get_thinking_budget(stage)
-
-
 log = logging.getLogger(__name__)
 
 
@@ -60,8 +55,8 @@ def plan_node(state: PipelineState) -> dict:
     Retrieves relevant lessons if any are found.
     """
     run_dir       = state["run_dir"]
-    task          = state.get("normalised_input") or state.get("raw_text_input", "")
-    task_type     = state.get("task_type", "coding")
+    task: str     = state.get("normalised_input") or state.get("raw_text_input") or ""
+    task_type: str = state.get("task_type") or "coding"
 
     # ── Compress ideation to save context window space ─────────────────────
     ideation_block = ""
@@ -106,7 +101,7 @@ def plan_node(state: PipelineState) -> dict:
 
     # ── Call via YAML template — no _SYSTEM constant needed ───────────────
     max_attempts = 3
-    plan = None
+    plan: Optional[PlanSpec] = None
 
     # Base template vars — search_block removed; plan.yaml's user_template
     # must have its {search_block} placeholder removed too (see that file).
@@ -141,7 +136,7 @@ def plan_node(state: PipelineState) -> dict:
 
     for attempt in range(max_attempts):
         try:
-            plan: PlanSpec = call_role(
+            plan = call_role(
                 role            = "plan",
                 template_vars   = template_vars,
                 extra_messages  = extra_messages if extra_messages else None,
@@ -175,15 +170,23 @@ def plan_node(state: PipelineState) -> dict:
                 # could auto-escalate) — reuse it as-is. Keep the model's
                 # own clarification_question if it wrote one; only
                 # substitute a generic prompt when it didn't.
-                plan = esc.result
-                if not plan.clarification_question:
-                    plan = plan.model_copy(update={
+                if esc.result is None:
+                    # call_role always attaches result for trigger=="low_confidence";
+                    # if that invariant ever breaks, fail loudly rather than continue
+                    # with no plan.
+                    raise RuntimeError(
+                        "EscalationNeeded(low_confidence) carried no result"
+                    ) from esc
+                esc_plan: PlanSpec = esc.result
+                if not esc_plan.clarification_question:
+                    esc_plan = esc_plan.model_copy(update={
                         "clarification_question": (
                             "I'm not fully confident in this plan and could "
                             "use more direction before continuing — what "
                             "would help clarify the task?"
                         ),
                     })
+                plan = esc_plan
                 log.info(
                     "Plan: low confidence on '%s' — asking for clarification "
                     "instead of escalating to '%s'",
@@ -258,6 +261,11 @@ def plan_node(state: PipelineState) -> dict:
                     ),
                 },
             ]
+
+    # The loop always either breaks with a plan or raises on the final attempt;
+    # this makes that invariant explicit (and narrows Optional[PlanSpec]).
+    if plan is None:
+        raise RuntimeError("Planner exited retry loop without producing a PlanSpec")
 
     # ── Escalation bookkeeping ──────────────────────────────────────────────
     # escalated_models/escalation_history are populated ONLY by the

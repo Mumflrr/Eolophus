@@ -8,7 +8,7 @@ not content, except for small classification and routing objects.
 """
 
 from __future__ import annotations
-from typing import Optional, TypedDict
+from typing import Optional, TypedDict, Required
 
 from schemas.task_classification import TaskClassification, Mode, TaskType
 from schemas.visual_description   import VisualDescription
@@ -30,8 +30,8 @@ class PipelineState(TypedDict, total=False):
     """
 
     # ── Run metadata ──────────────────────────────────────────────────────────
-    run_uuid:           str             # UUID for this run; also the runs/ directory name
-    run_dir:            str             # Absolute path to runs/{run_uuid}/
+    run_uuid:           Required[str]             # UUID for this run; also the runs/ directory name
+    run_dir:            Required[str]             # Absolute path to runs/{run_uuid}/
     mode:               str             # "short" | "long"  (from TaskClassification)
     task_type:          str             # "coding" | "ideation" | "mixed"
     is_sub_spec:        bool            # True if this is a sub-spec run
@@ -66,6 +66,33 @@ class PipelineState(TypedDict, total=False):
     # run-detail UI and for debugging auto-selection).
     profile:             Optional[str]
     requested_profile:   Optional[str]   # "auto" | "short" | "medium" | "long" | "ultra" — what the caller asked for, before auto-resolution
+    # The caller's explicit task_type pin for THIS invocation, distinct
+    # from task_type itself for exactly the reason requested_profile is
+    # distinct from profile above: classify_node returns "task_type" on
+    # every call (its resolved answer, read downstream by drafter.py,
+    # write_run, etc.), and a chat replan reuses this run's existing
+    # LangGraph checkpoint thread — so on a second invocation,
+    # state.get("task_type") no longer means "what the caller pinned", it
+    # means "what classify_node last decided". A node that read
+    # state.get("task_type") to detect a caller pin (as classify_node's
+    # pinned_task_type used to) was therefore silently treating its own
+    # prior output as a pin on every re-invocation after the first.
+    # requested_task_type is written ONLY by start_run/chat's turn-state
+    # construction from the actual request field, never by classify_node,
+    # so it unambiguously means "the caller asked for this" and nothing
+    # else can shadow it. Mirrors requested_profile exactly.
+    requested_task_type: Optional[str]
+    # Same reasoning as requested_task_type immediately above, for mode.
+    # Currently only run.py's CLI ever sets a caller-driven mode pin — the
+    # web API never writes state["mode"] from a request field at all, mode
+    # is purely informational there (see classify_node's profile-resolution
+    # comment: "mode plays no part in [profile] resolution"). Still routed
+    # through its own field rather than the raw "mode" key, since "mode" is
+    # ALSO classify_node's own output key on every call, and closing this
+    # off now avoids the same collision surfacing again the moment any
+    # future feature (web or CLI) adds a second mode-setting call on a
+    # reused thread.
+    requested_mode:      Optional[str]
     human_in_the_loop:   bool            # False = "set-and-forget": low confidence escalates instead of halting, and proceeds best-effort once the ladder is exhausted rather than waiting on /clarify
     # Per-stage current-model overrides produced by escalation, keyed by
     # stage name (e.g. {"draft": "35b"}). A stage with no entry here is

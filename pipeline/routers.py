@@ -8,25 +8,11 @@ identifying the next node. No routing logic lives anywhere else.
 from __future__ import annotations
 
 import logging
-from pathlib import Path
 
-import yaml
-
+from config.loader import get_routing_config
 from pipeline.state import PipelineState
 
 log = logging.getLogger(__name__)
-
-# ── Config ────────────────────────────────────────────────────────────────────
-
-_routing_cfg: dict = {}
-
-def _cfg() -> dict:
-    if not _routing_cfg:
-        p = Path(__file__).parent.parent / "config" / "routing.yaml"
-        with open(p) as f:
-            _routing_cfg.update(yaml.safe_load(f))
-    return _routing_cfg
-
 
 def _max_iterations(cfg: dict, profile: str) -> int:
     """
@@ -124,7 +110,7 @@ def resolve_profile(state: PipelineState) -> str:
 
 def node_set_for(profile: str) -> list[str]:
     """Return the configured node_set list for a profile name."""
-    cfg = _cfg()
+    cfg = get_routing_config()
     profiles = cfg.get("pipeline_profiles", {})
     return profiles.get(profile, {}).get("node_set", [])
 
@@ -248,7 +234,7 @@ def route_after_bugfix(state: PipelineState) -> str:
     knobs that could disagree with each other. See design doc's
     accompanying note on this removal.
     """
-    cfg = _cfg()
+    cfg = get_routing_config()
     ensemble_cfg  = cfg.get("ensemble", {})
 
     if not ensemble_cfg.get("enabled", True):
@@ -289,7 +275,7 @@ def route_after_bugfix(state: PipelineState) -> str:
 
 def route_after_critic_a(state: PipelineState) -> str:
     """After Critic A: run Critic B if enabled, else synthesise."""
-    cfg = _cfg()
+    cfg = get_routing_config()
     if cfg.get("ensemble", {}).get("run_critic_b", True):
         return "critic_b"
     return "synthesise"
@@ -323,7 +309,7 @@ def route_after_validate(state: PipelineState) -> str:
 
     category   = getattr(verdict, "category", "unresolvable")
     iteration  = state.get("iteration", 0)
-    cfg        = _cfg()
+    cfg        = get_routing_config()
     profile    = resolve_profile(state)
     max_iter   = _max_iterations(cfg, profile)
 

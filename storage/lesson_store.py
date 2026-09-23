@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -95,19 +96,35 @@ def write_lesson(lesson: Lesson) -> str:
         conn.close()
 
 
+_WORD_RE = re.compile(r"[a-z0-9_]+")
+
+
+def _text_similarity(a: str, b: str) -> float:
+    """Jaccard overlap of lowercase word sets — 1.0 identical, 0.0 disjoint."""
+    ta, tb = set(_WORD_RE.findall((a or "").lower())), set(_WORD_RE.findall((b or "").lower()))
+    union = ta | tb
+    return len(ta & tb) / len(union) if union else 1.0
+
+
 def _find_duplicate(lesson: Lesson) -> Optional[str]:
     """
     Check if a sufficiently similar lesson already exists.
     Similarity: same task_type + same issue_category + same model_caught
-                + tag overlap ratio >= dedup_threshold.
+                + tag overlap ratio >= dedup_threshold
+                + resolution_pattern word overlap >= dedup_text_threshold.
+    The text check matters: the metadata is coarse (issue_category often
+    "other", model_caught often "9b", tags derived from task type), so metadata
+    alone merged genuinely different rules into one row and DISCARDED the new
+    rule's text — only a counter on the old row went up.
     Returns existing lesson_uuid if found, else None.
     """
     threshold = _lr().get("dedup_threshold", 0.85)
+    text_threshold = _lr().get("dedup_text_threshold", 0.5)
     conn = get_conn()
     try:
         rows = conn.execute(
             """
-            SELECT lesson_uuid, tags FROM lessons
+            SELECT lesson_uuid, tags, resolution_pattern FROM lessons
             WHERE task_type = ?
               AND issue_category = ?
               AND model_caught = ?
@@ -121,13 +138,9 @@ def _find_duplicate(lesson: Lesson) -> Optional[str]:
     new_tags = set(lesson.tags)
     for row in rows:
         existing_tags = set(json.loads(row["tags"]))
-        if not existing_tags and not new_tags:
-            return row["lesson_uuid"]
         union = existing_tags | new_tags
-        if not union:
-            continue
-        overlap = len(existing_tags & new_tags) / len(union)
-        if overlap >= threshold:
+        tags_match = (not union) or (len(existing_tags & new_tags) / len(union) >= threshold)
+        if tags_match and _text_similarity(row["resolution_pattern"], lesson.resolution_pattern) >= text_threshold:
             return row["lesson_uuid"]
     return None
 

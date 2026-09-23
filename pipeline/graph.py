@@ -8,6 +8,7 @@ The graph is compiled once at module load and reused across runs.
 
 from __future__ import annotations
 
+from langchain_core.runnables import RunnableConfig
 import logging
 import os
 import sqlite3
@@ -336,7 +337,7 @@ def _run_sub_spec(
 
     try:
         app, callbacks = get_graph()
-        config = {"configurable": {"thread_id": sub_uuid}}
+        config: RunnableConfig = {"configurable": {"thread_id": sub_uuid}}
         if callbacks:
             config["callbacks"] = callbacks
         final_state = app.invoke(initial_state, config=config)
@@ -386,9 +387,9 @@ def _run_sub_spec(
 #   3. server.py's retry endpoint (POST /run/{run_uuid}/retry-truncated)
 #      resumes with Command(resume={"budget_tokens": <new cap>}).
 #      interrupt() returns that dict here.
-#   4. We set PIPELINE_STEP_OUTPUT_CAP_OVERRIDE for the duration of ONE
-#      re-invocation of the SAME node function (not the whole graph from
-#      classify/plan — just this one node runs again), then clear it.
+#   4. We scope a step_overrides(output_cap=...) around ONE re-invocation
+#      of the SAME node function (not the whole graph from classify/plan
+#      — just this one node runs again), then it's automatically cleared.
 #   5. If it truncates AGAIN, we interrupt() again with the new details —
 #      so a person can bump the cap more than once if needed. If it
 #      succeeds, its normal return dict flows on to the next node exactly
@@ -406,7 +407,7 @@ def _run_sub_spec(
 # A node can be resumed into more than once in a row (repeated truncation),
 # which is why step 5 loops rather than giving up after one retry attempt.
 def _wrap_node_for_truncation_retry(node_fn, node_name: str):
-    from clients.llm import TruncatedOutputError
+    from clients.llm import TruncatedOutputError, step_overrides
     from langgraph.types import interrupt
     import functools
     import json as _json
@@ -414,8 +415,20 @@ def _wrap_node_for_truncation_retry(node_fn, node_name: str):
 
     @functools.wraps(node_fn)
     def wrapped(state):
+        # pending_output_cap carries an override from one iteration to the
+        # NEXT node_fn(state) call. It must be applied via step_overrides()
+        # wrapping that call, not set-then-immediately-cleared in the same
+        # iteration: a bare `continue` inside try/finally runs `finally`
+        # before the loop's next iteration starts (verified — Python does
+        # not defer it), so the previous version's
+        # `with env_lock: os.environ[...] = ...; continue; finally: unset`
+        # was restoring the override before node_fn ever saw it on retry.
+        pending_output_cap = None
         while True:
             try:
+                if pending_output_cap is not None:
+                    with step_overrides(output_cap=pending_output_cap):
+                        return node_fn(state)
                 return node_fn(state)
             except TruncatedOutputError as exc:
                 payload = {
@@ -510,35 +523,17 @@ def _wrap_node_for_truncation_retry(node_fn, node_name: str):
                     # exact same (guaranteed-to-fail-again) value.
                     new_cap = max(int(exc.cap) * 2, int(exc.cap) + 256)
 
-                with env_lock:
-                    prev = os.environ.get("PIPELINE_STEP_OUTPUT_CAP_OVERRIDE")
-                    os.environ["PIPELINE_STEP_OUTPUT_CAP_OVERRIDE"] = str(int(new_cap))
-                try:
-                    log.info(
-                        "Retrying node '%s' (stage=%s) with output_cap=%d "
-                        "after truncation at cap=%s",
-                        node_name, exc.stage, new_cap, exc.cap,
-                    )
-                    # Loop back to `try: return node_fn(state)` above with
-                    # the override now in place for this one call.
-                    continue
-                finally:
-                    with env_lock:
-                        if prev is None:
-                            os.environ.pop("PIPELINE_STEP_OUTPUT_CAP_OVERRIDE", None)
-                        else:
-                            os.environ["PIPELINE_STEP_OUTPUT_CAP_OVERRIDE"] = prev
+                log.info(
+                    "Retrying node '%s' (stage=%s) with output_cap=%d "
+                    "after truncation at cap=%s",
+                    node_name, exc.stage, new_cap, exc.cap,
+                )
+                # Loop back to the top: pending_output_cap is applied via
+                # step_overrides() wrapping the NEXT node_fn(state) call.
+                pending_output_cap = int(new_cap)
+                continue
 
     return wrapped
-
-
-# env_lock (imported from clients.llm) guards PIPELINE_STEP_OUTPUT_CAP_OVERRIDE
-# the same single process-wide lock api/server.py uses for
-# PIPELINE_ULTRA/PIPELINE_FORCE_SHORT/PIPELINE_NO_ENSEMBLE — see clients/llm.py's
-# env_lock docstring for why this needs to be ONE shared lock object rather
-# than a separate Lock() per module.
-import os
-from clients.llm import env_lock
 
 
 # ── Graph construction ────────────────────────────────────────────────────────

@@ -50,6 +50,113 @@ from pydantic import BaseModel
 # by having every module that needs it import the one lock defined here.
 env_lock = threading.Lock()
 
+# ── Cooperative run cancellation ─────────────────────────────────────────────
+# DELETE /run/{uuid} used to only write status="cancelled" to run.json. Nothing
+# ever told the worker thread to stop, so app_graph.invoke() kept executing
+# every remaining node — and since the executor is single-worker, any new run
+# or chat turn queued behind it (while its run.json already said "running").
+# This is the "tell it" half: the API layer calls request_cancel(); the worker
+# polls at each model-call boundary and inside the streaming loop, and raises
+# RunCancelled, which unwinds through LangGraph to the thread function.
+#
+# RunCancelled derives from BaseException, NOT Exception, on purpose: this
+# codebase has many `except Exception` blocks — including _stream_completion's
+# non-streaming fallback, which would re-issue the whole request — that would
+# otherwise swallow it.
+#
+# _active_run is process-global. That is only correct because
+# state.executor is ThreadPoolExecutor(max_workers=1). If that ever changes,
+# replace it with a ContextVar (and verify LangGraph copies context into its
+# node threads before relying on that).
+class RunCancelled(BaseException):
+    """Raised inside a pipeline worker thread once its run has been cancelled."""
+
+
+_cancelled_runs: set[str] = set()
+_active_run: Optional[str] = None
+
+
+def request_cancel(run_uuid: str) -> None:
+    """Called from the API layer (DELETE /run/{uuid}) — any thread."""
+    _cancelled_runs.add(run_uuid)
+
+
+def clear_cancel(run_uuid: str) -> None:
+    """Forget a prior cancel. Call when SUBMITTING new work for a run (e.g. a
+    chat turn on a previously-cancelled run), not when the worker starts — a
+    cancel that lands while the work is still queued must survive until begin_run."""
+    _cancelled_runs.discard(run_uuid)
+
+
+def begin_run(run_uuid: str) -> None:
+    """Called first thing in a worker thread. Aborts immediately if the run was
+    cancelled while it was still waiting in the executor queue."""
+    global _active_run
+    _active_run = run_uuid
+    check_cancelled()
+
+
+def end_run() -> None:
+    global _active_run
+    _active_run = None
+
+
+def is_cancelled() -> bool:
+    return _active_run is not None and _active_run in _cancelled_runs
+
+
+def check_cancelled() -> None:
+    if is_cancelled():
+        raise RunCancelled(_active_run)
+
+# Per-step overrides for custom pipelines (pipeline/custom_graph.py) and
+# the truncation-retry wrapper (pipeline/graph.py), which each need to run
+# ONE node call with a different model/thinking-budget/output-cap than its
+# normal role assignment, without affecting any other call. Previously
+# these were process environment variables (PIPELINE_STEP_MODEL_OVERRIDE,
+# PIPELINE_STEP_BUDGET_OVERRIDE, PIPELINE_STEP_OUTPUT_CAP_OVERRIDE) mutated
+# under env_lock and restored in a try/finally at every call site — correct
+# only because today's setup is single-threaded per run (one GPU, ThreadPool
+# Executor(max_workers=1)); both call sites' own comments already flagged
+# this as a race condition waiting to happen under any future concurrency.
+# ContextVars are correct under concurrency with no lock and no manual
+# restore: each sets its value for the current execution context only, and
+# a plain function call (not a new thread/task) automatically inherits and
+# then restores the caller's context on return.
+#
+# env_lock itself is UNCHANGED and still guards api/server.py's separate
+# PIPELINE_ULTRA/PIPELINE_FORCE_SHORT/PIPELINE_NO_ENSEMBLE env vars, which
+# this module doesn't read — only the three step-level overrides moved.
+import contextvars
+from contextlib import contextmanager
+
+_step_model_override      : contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("step_model_override", default=None)
+_step_budget_override     : contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("step_budget_override", default=None)
+_step_output_cap_override : contextvars.ContextVar[Optional[int]] = contextvars.ContextVar("step_output_cap_override", default=None)
+
+
+@contextmanager
+def step_overrides(model: Optional[str] = None, budget: Optional[int] = None, output_cap: Optional[int] = None):
+    """
+    Scope a per-step model/thinking-budget/output-cap override to the
+    wrapped block. Replaces the PIPELINE_STEP_*_OVERRIDE env vars — see
+    the comment above. Only the overrides passed (non-None) are set;
+    unset ones fall through to call_role's normal role/profile resolution
+    exactly as before.
+    """
+    tokens = []
+    if model is not None:
+        tokens.append((_step_model_override, _step_model_override.set(model)))
+    if budget is not None:
+        tokens.append((_step_budget_override, _step_budget_override.set(budget)))
+    if output_cap is not None:
+        tokens.append((_step_output_cap_override, _step_output_cap_override.set(output_cap)))
+    try:
+        yield
+    finally:
+        for var, token in tokens:
+            var.reset(token)
+
 log = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
@@ -68,71 +175,66 @@ Do NOT set low confidence for stylistic preferences or minor implementation deta
 
 
 # ── Config loading ─────────────────────────────────────────────────────────────
+# All YAML config is read through config/loader.py — one cache for
+# models.yaml and one for routing.yaml, instead of every reader (this
+# module, model_manager.py, routers.py) reopening and reparsing its own
+# copy. The aliases below keep every existing call site in this file (and
+# describe.py, which imports these by name from clients.llm) unchanged.
 
-_config_cache: dict = {}
-
-def _load_config() -> dict:
-    if _config_cache:
-        return _config_cache
-    config_path = Path(__file__).parent.parent / "config" / "models.yaml"
-    with open(config_path) as f:
-        data = yaml.safe_load(f)
-    _config_cache.update(data)
-    return _config_cache
+from config.loader import (
+    get_models_config,
+    get_routing_config,
+    get_thinking_budget as _get_thinking_budget,
+    get_thinking_control_flag as _thinking_control_flag,
+    get_http_timeout as _get_http_timeout,
+    get_output_token_cap as _get_output_token_cap,
+)
 
 
-def _get_thinking_budget(stage: str, complexity: str = "moderate") -> int:
+def _build_thinking_extra_body(use_thinking: bool, tok_budget: Optional[int]) -> dict:
     """
-    Get the thinking token budget for a stage from routing.yaml.
-    Uses complexity-aware nested config: thinking_budgets.<stage>.<complexity>.
-    Falls back to 2048 if not configured.
+    The thinking part of a chat-completions request, in ONE place.
+
+    call_model, call_model_with_tools and describe_node each used to carry their
+    own copy of this logic, and the copies drifted (call_model tested the raw
+    budget_tokens argument instead of the resolved tok_budget, so routing.yaml's
+    thinking_budgets were silently ignored on that path). Everything that
+    builds a thinking request should go through here.
+
+      use_thinking False        -> thinking disabled
+      tok_budget == 0           -> thinking disabled   (routing.yaml: 0 = "NO THINKING";
+                                                        stating it as "disabled" is right
+                                                        whichever key the server honours)
+      tok_budget > 0            -> enabled, capped: reasoning_budget (the field
+                                   llama.cpp reads) + thinking.budget_tokens
+      tok_budget None or < 0    -> enabled, UNLIMITED (-1 is the explicit spelling,
+                                   e.g. the ultra_* keys)
     """
-    import yaml as _yaml
-    try:
-        rp = Path(__file__).parent.parent / "config" / "routing.yaml"
-        with open(rp) as f:
-            rcfg = _yaml.safe_load(f)
-        stage_cfg = rcfg.get("thinking_budgets", {}).get(stage, {})
-        if isinstance(stage_cfg, dict):
-            return stage_cfg.get(complexity, stage_cfg.get("moderate", 2048))
-        return int(stage_cfg) if stage_cfg else 2048
-    except Exception:
-        return 2048
-
-
-def _get_http_timeout() -> float:
-    """Read HTTP timeout from routing.yaml. Default 7200s (2 hours)."""
-    import yaml as _yaml
-    try:
-        rp = Path(__file__).parent.parent / "config" / "routing.yaml"
-        with open(rp) as f:
-            rcfg = _yaml.safe_load(f)
-        return float(rcfg.get("http", {}).get("timeout_seconds", 7200))
-    except Exception:
-        return 7200.0
-
-
-def _get_output_token_cap(stage: str) -> Optional[int]:
-    """
-    Read the hard output-length cap for a stage from routing.yaml
-    (output_token_caps.<stage>), for passing as max_tokens on the API call.
-    Returns None (no cap — unbounded, previous behaviour) if the stage
-    isn't listed or the config can't be read.
-    """
-    import yaml as _yaml
-    try:
-        rp = Path(__file__).parent.parent / "config" / "routing.yaml"
-        with open(rp) as f:
-            rcfg = _yaml.safe_load(f)
-        cap = rcfg.get("output_token_caps", {}).get(stage)
-        return int(cap) if cap else None
-    except Exception:
-        return None
+    thinking_on = bool(use_thinking) and tok_budget != 0
+    if not thinking_on:
+        body: dict = {"thinking": {"type": "disabled"}}
+    elif tok_budget is None or tok_budget < 0:
+        body = {"thinking": {"type": "enabled"}}
+    else:
+        body = {
+            "reasoning_budget": tok_budget,
+            "thinking": {"type": "enabled", "budget_tokens": tok_budget},
+        }
+    # The `thinking` object above is an Anthropic-style field; llama.cpp does not
+    # document it. The switch llama.cpp DOES document for Qwen-style templates
+    # (with --jinja) is chat_template_kwargs.enable_thinking. Without it, a
+    # "non-thinking" stage can still think — invisibly, in reasoning_content —
+    # and a long enough prompt (see classify) turns that into a runaway that only
+    # max_tokens stops. Harmless where the template ignores it. Kill switch:
+    # routing.yaml  thinking_control.chat_template_kwargs: false
+    if _thinking_control_flag("chat_template_kwargs", True):
+        body["chat_template_kwargs"] = {"enable_thinking": thinking_on}
+    return body
 
 
 def get_model_config(model_id: str) -> dict:
     """Return the config block for a model_id (e.g. '9b', '35b')."""
-    cfg = _load_config()
+    cfg = get_models_config()
     if model_id not in cfg["models"]:
         raise ValueError(f"Unknown model_id '{model_id}'. Check config/models.yaml.")
     return cfg["models"][model_id]
@@ -140,7 +242,7 @@ def get_model_config(model_id: str) -> dict:
 
 def resolve_role(role: str) -> str:
     """Resolve a role name to a model_id via config/models.yaml roles mapping."""
-    cfg = _load_config()
+    cfg = get_models_config()
     if role not in cfg["roles"]:
         raise ValueError(f"Unknown role '{role}'. Check config/models.yaml roles section.")
     return cfg["roles"][role]
@@ -159,8 +261,7 @@ def resolve_role(role: str) -> str:
 
 def get_escalation_ladder(role: str) -> list[str]:
     """Return the ordered list of model_ids to escalate `role` through."""
-    cfg = _load_config()
-    return cfg.get("escalation_ladders", {}).get(role, []) or []
+    return get_models_config().get("escalation_ladders", {}).get(role, []) or []
 
 
 def next_escalation_model(role: str, current_model_id: str) -> Optional[str]:
@@ -420,10 +521,14 @@ def _build_logit_bias(model_cfg: dict) -> Optional[dict[str, float]]:
 
 # ── LLMLingua-2 compression ───────────────────────────────────────────────────
 
-_lingua_compressor = None
+_lingua_compressor: Any = None
+_lingua_unavailable: bool = False
 
-def _get_compressor():
-    global _lingua_compressor
+def _get_compressor() -> Any:
+    """Returns the LLMLingua PromptCompressor, or None if llmlingua isn't installed."""
+    global _lingua_compressor, _lingua_unavailable
+    if _lingua_unavailable:
+        return None
     if _lingua_compressor is None:
         try:
             from llmlingua import PromptCompressor
@@ -435,8 +540,9 @@ def _get_compressor():
             log.info("LLMLingua-2 compressor initialised")
         except ImportError:
             log.warning("llmlingua not installed — compression disabled. pip install llmlingua")
-            _lingua_compressor = "unavailable"
-    return _lingua_compressor if _lingua_compressor != "unavailable" else None
+            _lingua_unavailable = True
+            return None
+    return _lingua_compressor
 
 
 def compress_text(
@@ -458,7 +564,7 @@ def compress_text(
 
     try:
         result = compressor.compress_prompt(
-            text,
+            [text],
             rate=ratio,
             force_tokens=["\n"],
         )
@@ -591,7 +697,7 @@ def _log_stage_entry(
         f.write(json.dumps(entry) + "\n")
 
     try:
-        from langfuse.decorators import langfuse_context
+        from langfuse.decorators import langfuse_context  # pyright: ignore[reportMissingImports]
         langfuse_context.update_current_observation(
             metrics={
                 "model_load_ms": round(load_ms, 1),
@@ -647,7 +753,21 @@ def _stream_completion(
     extra_body,
     stage:      str,
     max_tokens: Optional[int] = None,
+    reasoning_sink: Optional[list] = None,
+    presence_penalty: Optional[float] = None,
 ):
+    """
+    Stream one completion. Returns (content, usage, ttft_ms, think_toks, token_count, finish_reason).
+
+    llama.cpp (--jinja) delivers a thinking model's thinking in a separate
+    `reasoning_content` delta rather than as <think> text in `content`. That
+    used to be dropped on the floor here: never counted (think_ratio read 0.0 on
+    every stage), never logged, and never attached to a TruncatedOutputError —
+    so a stage that burned its whole cap thinking looked like it had produced
+    nothing. If `reasoning_sink` is given, reasoning text is appended to it
+    (the return tuple is unchanged so other callers are unaffected), and those
+    tokens now count toward think_toks / token_count.
+    """
     chunks      = []
     token_count = 0
     in_think    = False
@@ -660,7 +780,7 @@ def _stream_completion(
     ttft_ms     = 0.0
 
     try:
-        stream = client.chat.completions.create(
+        create_kwargs = dict(
             model      = model_id,
             messages   = messages,
             temperature= temp,
@@ -676,12 +796,31 @@ def _stream_completion(
             # chunk with usage populated right before the stream closes.
             stream_options = {"include_usage": True},
         )
+        if presence_penalty is not None:
+            create_kwargs["presence_penalty"] = presence_penalty
+        stream = client.chat.completions.create(**create_kwargs)
 
         for chunk in stream:
+            if is_cancelled():
+                # Closing the response drops the HTTP connection, which makes
+                # llama-server abort generation (frees the GPU immediately).
+                # RunCancelled is a BaseException, so the `except Exception`
+                # non-streaming fallback below can't catch it.
+                try:
+                    stream.close()
+                except Exception:
+                    pass
+                raise RunCancelled(_active_run)
             if ttft_ms == 0.0:
                 ttft_ms = (time.perf_counter() - start_ts) * 1000
 
             delta = chunk.choices[0].delta if chunk.choices else None
+            reasoning_piece = getattr(delta, "reasoning_content", None) if delta else None
+            if reasoning_piece:
+                token_count += 1
+                think_toks  += 1
+                if reasoning_sink is not None:
+                    reasoning_sink.append(reasoning_piece)
             if delta and delta.content:
                 text = delta.content
                 chunks.append(text)
@@ -713,6 +852,9 @@ def _stream_completion(
             max_tokens=max_tokens, extra_body=extra_body,
         )
         finish_reason = resp.choices[0].finish_reason
+        fallback_reasoning = getattr(resp.choices[0].message, "reasoning_content", None) or ""
+        if fallback_reasoning and reasoning_sink is not None:
+            reasoning_sink.append(fallback_reasoning)
         return (
             resp.choices[0].message.content or "", resp.usage, 0.0, 0, 0, finish_reason
         )
@@ -723,6 +865,119 @@ def _stream_completion(
 
 
 # ── Core call function ────────────────────────────────────────────────────────
+
+# ── Shared per-call setup ────────────────────────────────────────────────────
+# call_model() and call_model_with_tools() both need: resolve the model's
+# config, swap VRAM if this model isn't the one currently loaded (and read
+# back its memory footprint if a swap just happened), resolve thinking
+# mode/budget via _build_thinking_extra_body(), and build the OpenAI
+# client. Used to be ~25 duplicated lines in each function.
+
+class _PreparedCall:
+    """Bag of values _prepare_call() resolves once per model call."""
+    __slots__ = (
+        "cfg", "model_name", "temp", "top_p", "presence_penalty",
+        "load_ms", "memory_usage", "extra_body", "raw_client", "output_cap",
+    )
+    def __init__(self, **kw):
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _prepare_call(
+    model_id:             str,
+    stage:                str,
+    thinking:              Optional[bool],
+    budget_tokens:          Optional[int],
+    output_cap_override:    Optional[int],
+) -> _PreparedCall:
+    check_cancelled()   # don't swap models for a run that's already been cancelled
+    cfg        = get_model_config(model_id)
+    base_url   = cfg["base_url"]
+    temp       = cfg.get("temperature", 0.6)
+    top_p      = cfg.get("top_p", 0.95)
+    # Only forward presence_penalty when a model config actually sets one
+    # (e.g. 35b's presence_penalty: 1.0, "prevents infinite loops in <think>
+    # tags") — previously declared in models.yaml but never read by any
+    # call site, so it did nothing for any model, including 35b. None here
+    # means omit it from the request entirely, not send an explicit 0.0.
+    presence_penalty = cfg.get("presence_penalty")
+
+    load_start = time.perf_counter()
+    memory_usage = None
+    try:
+        from clients.model_manager import ensure_model_loaded
+        did_load = ensure_model_loaded(model_id)
+    except Exception as e:
+        log.warning("model_manager.ensure_model_loaded failed: %s", e)
+        did_load = False
+    load_ms = (time.perf_counter() - load_start) * 1000
+    check_cancelled()   # cancel may have landed during the swap — skip sending the prompt
+
+    if did_load:
+        # Only worth reading the log for memory data when a load actually
+        # just happened. Best-effort: get_load_memory() never raises.
+        try:
+            from clients.model_memory import get_load_memory
+            logs_dir = Path(__file__).parent.parent / "logs"
+            memory_usage = get_load_memory(model_id, logs_dir)
+        except Exception as e:
+            log.warning("model_memory.get_load_memory failed: %s", e)
+
+    thinking_default = cfg.get("thinking", {}).get("default_on", False)
+    use_thinking      = thinking if thinking is not None else thinking_default
+    tok_budget        = budget_tokens if budget_tokens is not None else _get_thinking_budget(stage)
+    extra_body        = _build_thinking_extra_body(use_thinking, tok_budget)
+
+    raw_client = OpenAI(base_url=base_url, api_key="local", max_retries=0, timeout=_get_http_timeout())
+    output_cap = output_cap_override if output_cap_override is not None else _get_output_token_cap(stage)
+
+    return _PreparedCall(
+        cfg=cfg, model_name=cfg["name"], temp=temp, top_p=top_p, presence_penalty=presence_penalty,
+        load_ms=load_ms, memory_usage=memory_usage,
+        extra_body=extra_body, raw_client=raw_client, output_cap=output_cap,
+    )
+
+
+def _repair_malformed_response(
+    client, model_id: str, messages: list[dict], answer: str,
+    response_schema: Type[T], max_retries: int, temp: float, output_cap: Optional[int],
+    presence_penalty: Optional[float] = None,
+) -> T:
+    """
+    One retry with a corrective follow-up message, used by both call_model()
+    and call_model_with_tools() when the model's answer didn't parse as
+    response_schema. Small/quantized models occasionally emit a JSON
+    *schema* (properties/$defs/type keys) instead of an instance, or drop a
+    comma — this names the mistake explicitly rather than just resending
+    the same prompt.
+    """
+    field_names = list(response_schema.model_fields.keys())
+    fields_hint = ", ".join(f'"{f}": <value>' for f in field_names[:6])
+    repair_kwargs = dict(
+        model      = model_id,
+        messages   = messages + [
+            {"role": "assistant", "content": answer},
+            {"role": "user",      "content": (
+                f"Your previous response could not be parsed. "
+                f"Respond with a JSON object that is an INSTANCE (filled-in values), "
+                f"NOT a schema definition. "
+                f"Required fields: {field_names}. "
+                f"Example structure: {{{fields_hint}}}. "
+                f"Do not include $defs, properties, or type keys — "
+                f"those are schema keywords, not values."
+            )},
+        ],
+        response_model = response_schema,
+        max_retries    = max_retries,
+        temperature    = temp,
+        max_tokens     = output_cap,
+    )
+    if presence_penalty is not None:
+        repair_kwargs["presence_penalty"] = presence_penalty
+    result, _completion = client.chat.completions.create_with_completion(**repair_kwargs)
+    return result
+
 
 def call_model(
     model_id:        str,
@@ -739,117 +994,45 @@ def call_model(
     output_cap_override: Optional[int] = None,
 ) -> T:
     """
-    Make a structured model call via Instructor.
+    Make a structured model call via Instructor. See _prepare_call() for
+    model/thinking/client setup shared with call_model_with_tools().
 
-    Args:
-        model_id:        Model identifier from models.yaml (e.g. '9b', '35b')
-        messages:        List of {role, content} dicts (already built).
-        response_schema: Pydantic model class to parse the response into.
-        stage:           Pipeline stage name for logging (e.g. 'plan', 'draft').
-        run_dir:         Path to the current run directory for log files.
-        thinking:        Override thinking mode. None = use model default.
-        budget_tokens:   Override thinking budget. None = use routing.yaml value.
-        compress_system: If True, apply LLMLingua-2 to system message content.
-        compress_ratio:  Compression ratio if compress_system is True.
-        max_retries:     Instructor retry attempts on malformed output.
-        skip_nowait:     If True, skip NoWait logit bias (e.g. chess reasoning).
-        output_cap_override: If set, replaces the routing.yaml
-            output_token_caps.<stage> value for just this call, without
-            touching routing.yaml or affecting any other call. Used by
-            the truncation-retry path (see graph.py's node-retry wrapper)
-            to re-run a single node with a higher max_tokens after a
-            TruncatedOutputError.
-
-    Returns:
-        Populated instance of response_schema.
+    output_cap_override: replaces routing.yaml's output_token_caps.<stage>
+    for just this call — used by the truncation-retry path (graph.py's
+    node-retry wrapper) to re-run one node with a higher max_tokens after
+    a TruncatedOutputError, without touching routing.yaml itself.
     """
-    cfg        = get_model_config(model_id)
-    base_url   = cfg["base_url"]
-    model_name = cfg["name"]
-    temp       = cfg.get("temperature", 0.6)
-    top_p      = cfg.get("top_p", 0.95)
-
-    # ── Model load (VRAM swap tracking) ───────────────────────────────────────
-    load_start = time.perf_counter()
-    memory_usage = None
-    try:
-        from clients.model_manager import ensure_model_loaded
-        did_load = ensure_model_loaded(model_id)
-    except Exception as e:
-        log.warning("model_manager.ensure_model_loaded failed: %s", e)
-        did_load = False
-    load_ms = (time.perf_counter() - load_start) * 1000
-
-    if did_load:
-        # Only worth reading the log for memory data when a load actually
-        # just happened — see ensure_model_loaded's docstring. Best-effort:
-        # get_load_memory() never raises, returns None on any failure
-        # (missing -lv 4, unparseable log, etc.) — same philosophy as
-        # search_web(), a missing memory reading shouldn't affect the call.
-        try:
-            from clients.model_memory import get_load_memory
-            logs_dir = Path(__file__).parent.parent / "logs"
-            memory_usage = get_load_memory(model_id, logs_dir)
-        except Exception as e:
-            log.warning("model_memory.get_load_memory failed: %s", e)
-
-    # ── Thinking settings ─────────────────────────────────────────────────────
-    thinking_default = cfg.get("thinking", {}).get("default_on", False)
-    use_thinking     = thinking if thinking is not None else thinking_default
-
-    if budget_tokens is not None:
-        tok_budget = budget_tokens
-    else:
-        tok_budget = _get_thinking_budget(stage)
-
-    # ── LLMLingua-2 compression ───────────────────────────────────────────────
     if compress_system:
         for msg in messages:
             if msg.get("role") == "system":
                 msg["content"] = compress_text(msg["content"], ratio=compress_ratio)
                 break
 
-    # ── Prompt hash ───────────────────────────────────────────────────────────
     prompt_str  = json.dumps(messages, sort_keys=True)
     prompt_hash = hashlib.sha256(prompt_str.encode()).hexdigest()[:12]
 
-    # ── extra_body ────────────────────────────────────────────────────────────
-    extra_body: dict[str, Any] = {}
-    if use_thinking:
-        # budget_tokens=-1 means unlimited — omit budget_tokens from the
-        # thinking config so llama.cpp imposes no per-call cap.
-        if budget_tokens is not None and budget_tokens >= 0:
-            extra_body["reasoning_budget"] = budget_tokens
-            extra_body["thinking"] = {
-                "type":          "enabled",
-                "budget_tokens": budget_tokens,
-            }
-        else:
-            # -1 or None with thinking=True → unlimited
-            extra_body["thinking"] = {"type": "enabled"}
-    else:
-        extra_body["thinking"] = {"type": "disabled"}
+    pc = _prepare_call(model_id, stage, thinking, budget_tokens, output_cap_override)
+    cfg, model_name, temp, top_p = pc.cfg, pc.model_name, pc.temp, pc.top_p
+    presence_penalty = pc.presence_penalty
+    load_ms, memory_usage        = pc.load_ms, pc.memory_usage
+    extra_body, raw_client, output_cap = pc.extra_body, pc.raw_client, pc.output_cap
 
-    logit_bias = _build_logit_bias(cfg) if not skip_nowait else None
-    if logit_bias:
-        extra_body["logit_bias"] = logit_bias
+    if not skip_nowait:
+        logit_bias = _build_logit_bias(cfg)
+        if logit_bias:
+            extra_body["logit_bias"] = logit_bias
 
-    # ── Clients ───────────────────────────────────────────────────────────────
-    # timeout was previously hardcoded to 1200.0, silently ignoring the
-    # configured routing.yaml http.timeout_seconds (default 7200s) — long
-    # stages (large budget_tokens, big models) could exceed 20 minutes
-    # legitimately and get killed here regardless of config.
-    raw_client = OpenAI(base_url=base_url, api_key="local", max_retries=0, timeout=_get_http_timeout())
-    client     = instructor.from_openai(raw_client, mode=instructor.Mode.JSON)
+    client = instructor.from_openai(raw_client, mode=instructor.Mode.JSON)
 
     retries_used = 0
     start_ts     = time.perf_counter()
-    output_cap   = output_cap_override if output_cap_override is not None else _get_output_token_cap(stage)
 
+    reasoning_sink: list = []
     try:
         raw_content, usage, ttft_ms, think_toks, gen_toks, finish_reason = _stream_completion(
             raw_client, cfg["model_id"], messages, temp, top_p,
             extra_body if extra_body else None, stage, max_tokens=output_cap,
+            reasoning_sink=reasoning_sink, presence_penalty=presence_penalty,
         )
 
         # ── Extract thinking BEFORE the truncation check ────────────────────
@@ -879,6 +1062,14 @@ def call_model(
             thinking_block, answer, confidence_signal = _extract_thinking_partial(raw_content)
         else:
             thinking_block, answer, confidence_signal = _extract_thinking(raw_content)
+
+        # Thinking that arrived in reasoning_content (see _stream_completion) is
+        # merged in for LOGGING and for the truncation error only — deliberately
+        # NOT for confidence_signal, which is still read from <think> text in
+        # `content` exactly as before, so escalation behaviour is unchanged.
+        reasoning_text = "".join(reasoning_sink)
+        if reasoning_text:
+            thinking_block = "\n".join(x for x in (reasoning_text, thinking_block) if x)
 
         if thinking_block:
             _write_thinking_log(run_dir, stage, thinking_block)
@@ -914,26 +1105,9 @@ def call_model(
             result: T = response_schema.model_validate_json(answer)
             retries_used = 0
         except Exception:
-            field_names = list(response_schema.model_fields.keys())
-            fields_hint = ", ".join(f'"{f}": <value>' for f in field_names[:6])
-            result, completion = client.chat.completions.create_with_completion(
-                model      = cfg["model_id"],
-                messages   = messages + [
-                    {"role": "assistant", "content": answer},
-                    {"role": "user",      "content": (
-                        f"Your previous response could not be parsed. "
-                        f"Respond with a JSON object that is an INSTANCE (filled-in values), "
-                        f"NOT a schema definition. "
-                        f"Required fields: {field_names}. "
-                        f"Example structure: {{{fields_hint}}}. "
-                        f"Do not include $defs, properties, or type keys — "
-                        f"those are schema keywords, not values."
-                    )},
-                ],
-                response_model = response_schema,
-                max_retries    = max_retries,
-                temperature    = temp,
-                max_tokens     = output_cap,
+            result = _repair_malformed_response(
+                client, cfg["model_id"], messages, answer, response_schema, max_retries, temp, output_cap,
+                presence_penalty,
             )
             retries_used = max_retries
 
@@ -1051,84 +1225,30 @@ def call_model_with_tools(
 ) -> tuple[T, list[ToolCallRecord]]:
     """
     Like call_model(), but lets the model call tools mid-generation before
-    producing its final structured answer.
+    producing its final structured answer. See _prepare_call() for setup
+    shared with call_model().
 
-    Loop: send messages+tools -> if the model returns tool_calls, run each
-    one via tool_impls, append the assistant tool_calls message AND a
-    "tool" role message per result, and go again -> once the model returns
-    no tool_calls, treat message.content as the final answer and parse it
-    into response_schema exactly like call_model() does.
+    Loop: send messages+tools -> run any tool_calls via tool_impls, append
+    the assistant + per-tool "tool" messages, go again -> once the model
+    returns no tool_calls, parse message.content as response_schema like
+    call_model() does. Raises TruncatedOutputError if any round hits the
+    output cap. max_tool_rounds caps tool round-trips before the model is
+    forced to answer (tool_choice="none"); hitting it does not raise.
 
-    max_tool_rounds caps how many times the model can call a tool before
-    we force it to answer (guards against a model that keeps calling
-    search_web indefinitely). Hitting the cap does not raise — the last
-    response is parsed as the final answer, same as if the model had
-    stopped calling tools on its own; a model this deep into tool use
-    usually has enough context to answer even if it would have preferred
-    one more round.
+    Returns (parsed_result, tool_call_history) for callers that want to
+    log/display what was searched.
 
-    Returns (parsed_result, tool_call_history) — the history is new
-    information call_model() has no equivalent of, since no tool calls
-    are possible on that path. Callers that want to log/display "what was
-    searched" (e.g. writing it into a run's stage log, or surfacing it in
-    the UI) should persist tool_call_history themselves; this function
-    does not write it to run_dir on its own, matching call_model()'s
-    existing pattern of leaving artifact-writing to callers/nodes.
-
-    NOTE on thinking capture: llama.cpp surfaces thinking-mode output on
-    tool-calling responses as a separate `reasoning_content` field on the
-    message, NOT as <think>...</think> tags inside `content` the way
-    call_model()/_extract_thinking expect (confirmed via
-    test_tool_calling.py's raw response dump). This function captures
-    reasoning_content into the thinking log the same way call_model()
-    captures <think> blocks, but does NOT attempt <confidence> tag
-    extraction from it — that convention was designed for the
-    embedded-tag format and hasn't been validated against
-    reasoning_content's structure. If you need confidence signals out of
-    a tool-calling call, have the model put it in the structured
-    response_schema's confidence field directly rather than relying on
-    tag-scraping here.
+    llama.cpp puts tool-calling thinking output in a separate
+    reasoning_content field, not <think> tags in content — captured into
+    the thinking log the same way, but NOT run through <confidence> tag
+    extraction (untested against reasoning_content's structure — put
+    confidence in the response_schema directly instead).
     """
-    cfg        = get_model_config(model_id)
-    base_url   = cfg["base_url"]
-    model_name = cfg["name"]
-    temp       = cfg.get("temperature", 0.6)
-    top_p      = cfg.get("top_p", 0.95)
-
-    load_start = time.perf_counter()
-    memory_usage = None
-    try:
-        from clients.model_manager import ensure_model_loaded
-        did_load = ensure_model_loaded(model_id)
-    except Exception as e:
-        log.warning("model_manager.ensure_model_loaded failed: %s", e)
-        did_load = False
-    load_ms = (time.perf_counter() - load_start) * 1000
-
-    if did_load:
-        try:
-            from clients.model_memory import get_load_memory
-            logs_dir = Path(__file__).parent.parent / "logs"
-            memory_usage = get_load_memory(model_id, logs_dir)
-        except Exception as e:
-            log.warning("model_memory.get_load_memory failed: %s", e)
-
-    thinking_default = cfg.get("thinking", {}).get("default_on", False)
-    use_thinking     = thinking if thinking is not None else thinking_default
-    tok_budget       = budget_tokens if budget_tokens is not None else _get_thinking_budget(stage)
-
-    extra_body: dict[str, Any] = {}
-    if use_thinking:
-        if tok_budget is not None and tok_budget >= 0:
-            extra_body["reasoning_budget"] = tok_budget
-            extra_body["thinking"] = {"type": "enabled", "budget_tokens": tok_budget}
-        else:
-            extra_body["thinking"] = {"type": "enabled"}
-    else:
-        extra_body["thinking"] = {"type": "disabled"}
-
-    raw_client = OpenAI(base_url=base_url, api_key="local", max_retries=0, timeout=_get_http_timeout())
-    output_cap = output_cap_override if output_cap_override is not None else _get_output_token_cap(stage)
+    pc = _prepare_call(model_id, stage, thinking, budget_tokens, output_cap_override)
+    cfg, model_name, temp, top_p        = pc.cfg, pc.model_name, pc.temp, pc.top_p
+    load_ms, memory_usage               = pc.load_ms, pc.memory_usage
+    extra_body, raw_client, output_cap  = pc.extra_body, pc.raw_client, pc.output_cap
+    presence_penalty = pc.presence_penalty
 
     working_messages = list(messages)  # don't mutate caller's list
     tool_history: list[ToolCallRecord] = []
@@ -1136,11 +1256,12 @@ def call_model_with_tools(
     rounds   = 0
 
     while True:
+        check_cancelled()
         rounds += 1
         force_final = rounds > max_tool_rounds
 
         try:
-            resp = raw_client.chat.completions.create(
+            create_kwargs = dict(
                 model       = cfg["model_id"],
                 messages    = working_messages,
                 tools       = None if force_final else tools,
@@ -1150,6 +1271,9 @@ def call_model_with_tools(
                 max_tokens  = output_cap,
                 extra_body  = extra_body if extra_body else None,
             )
+            if presence_penalty is not None:
+                create_kwargs["presence_penalty"] = presence_penalty
+            resp = raw_client.chat.completions.create(**create_kwargs)
         except Exception as exc:
             elapsed_ms = (time.perf_counter() - start_ts) * 1000
             _log_stage_entry(
@@ -1162,11 +1286,51 @@ def call_model_with_tools(
             log.error("[%s] %s tool-call round %d failed: %s", stage, model_name, rounds, exc)
             raise
 
+        # This request is non-streaming, so a cancel that landed during it can only be
+        # noticed now — stop before executing any tool calls or issuing another round.
+        check_cancelled()
         msg = resp.choices[0].message
 
         reasoning = getattr(msg, "reasoning_content", None) or ""
         if reasoning:
             _write_thinking_log(run_dir, stage, reasoning)
+
+        # ── Truncation check — call_model has always had this; this path didn't ──
+        # A round cut off by max_tokens is incomplete content, not malformed
+        # JSON. Without this, a truncated final answer went straight to
+        # model_validate_json, failed, and triggered the Instructor repair call
+        # (up to max_retries more generations of up to output_cap tokens each)
+        # on a half-written answer; a truncated TOOL round is worse, since its
+        # arguments can't be trusted. Raising TruncatedOutputError here — same
+        # exception, same content attached — means call_role's escalation walk /
+        # EscalationNeeded confirmation and graph.py's truncation-retry wrapper
+        # now cover tool-calling stages too.
+        finish_reason = resp.choices[0].finish_reason
+        if finish_reason in ("length", "max_tokens"):
+            thinking_block, partial_answer, _ = _extract_thinking_partial(msg.content or "")
+            thinking_block   = reasoning or thinking_block
+            tokens_out_trunc = resp.usage.completion_tokens if resp.usage else 0
+            elapsed_ms       = (time.perf_counter() - start_ts) * 1000
+            _log_stage_entry(
+                run_dir=run_dir, stage=stage, model_name=model_name,
+                prompt_hash=hashlib.sha256(json.dumps(messages, sort_keys=True).encode()).hexdigest()[:12],
+                tokens_in=resp.usage.prompt_tokens if resp.usage else 0, tokens_out=tokens_out_trunc,
+                latency_ms=elapsed_ms, status="truncated", retries=0,
+                load_ms=load_ms, ttft_ms=0.0,
+                think_ratio=len(thinking_block) / max(len(thinking_block) + len(partial_answer), 1),
+                memory_usage=memory_usage,
+            )
+            log.error(
+                "[%s] %s tool-call round %d truncated at max_tokens=%s (%d tokens; %d chars thinking, %d chars answer)",
+                stage, model_name, rounds, output_cap, tokens_out_trunc, len(thinking_block), len(partial_answer),
+            )
+            raise TruncatedOutputError(
+                stage=stage,
+                cap=output_cap if output_cap is not None else tokens_out_trunc,
+                tokens_out=tokens_out_trunc,
+                thinking_block=thinking_block,
+                partial_answer=partial_answer,
+            )
 
         if msg.tool_calls and not force_final:
             log.info(
@@ -1221,27 +1385,10 @@ def call_model_with_tools(
         result: T = response_schema.model_validate_json(answer)
         retries_used = 0
     except Exception:
-        field_names = list(response_schema.model_fields.keys())
-        fields_hint = ", ".join(f'"{f}": <value>' for f in field_names[:6])
         client = instructor.from_openai(raw_client, mode=instructor.Mode.JSON)
-        result, _completion = client.chat.completions.create_with_completion(
-            model      = cfg["model_id"],
-            messages   = working_messages + [
-                {"role": "assistant", "content": answer},
-                {"role": "user",      "content": (
-                    f"Your previous response could not be parsed. "
-                    f"Respond with a JSON object that is an INSTANCE (filled-in values), "
-                    f"NOT a schema definition. "
-                    f"Required fields: {field_names}. "
-                    f"Example structure: {{{fields_hint}}}. "
-                    f"Do not include $defs, properties, or type keys — "
-                    f"those are schema keywords, not values."
-                )},
-            ],
-            response_model = response_schema,
-            max_retries    = max_retries,
-            temperature    = temp,
-            max_tokens     = output_cap,
+        result = _repair_malformed_response(
+            client, cfg["model_id"], working_messages, answer, response_schema, max_retries, temp, output_cap,
+            presence_penalty,
         )
         retries_used = max_retries
 
@@ -1296,12 +1443,22 @@ class EscalationNeeded(Exception):
                           object to return — the caller falls back to
                           exc.__cause__ / re-raising if declined)
     """
-    def __init__(self, stage, current_model_id, next_model_id, trigger, result=None):
+    def __init__(
+        self,
+        stage:            str,
+        current_model_id: str,
+        next_model_id:    str,
+        trigger:          str,
+        result:           Optional[Any] = None,
+    ):
         self.stage             = stage
         self.current_model_id  = current_model_id
         self.next_model_id     = next_model_id
         self.trigger           = trigger
-        self.result            = result
+        # Any (not BaseModel): callers immediately use it as their own
+        # response_schema type (TaskClassification, PlanSpec, ...), and this
+        # exception is deliberately schema-agnostic.
+        self.result: Optional[Any] = result
         super().__init__(
             f"Stage '{stage}' wants to escalate {current_model_id} → "
             f"{next_model_id} ({trigger}) — awaiting confirmation."
@@ -1331,131 +1488,39 @@ def call_role(
 ) -> T:
     """
     Primary interface for all node files. Resolves role → model, builds
-    messages from YAML prompt template, and delegates to call_model() (or
-    call_model_with_tools() when tools= is supplied).
+    messages from a YAML prompt template (or uses explicit messages= if
+    given), and delegates to call_model() — or call_model_with_tools()
+    when tools= is supplied.
 
-    Two usage modes:
+    Mode A (preferred): pass template_vars={...} and role="plan" etc. —
+    messages are built from config/prompts/<role>.yaml, with a confidence
+    instruction auto-injected if response_schema has a confidence field.
+    Mode B (legacy/multi-turn): pass messages= explicitly; the YAML system
+    prompt is prepended only if messages has no system message already.
+    Passing tools=[...] works in either mode; call_role always returns
+    just the parsed response_schema instance (not the tool-call history —
+    use tool_history_sink=[] to also get that back, or
+    call_role_with_tool_history() for the raw tuple).
 
-    MODE A — YAML-driven (preferred for new/migrated nodes):
-        call_role(
-            role="plan",
-            template_vars={"task": task_text, "ideation_block": ideation_str},
-            response_schema=PlanSpec,
-            stage="plan",
-            run_dir=run_dir,
-            thinking=True,
-        )
-        Messages are built automatically from config/prompts/plan.yaml.
-        Confidence instruction is injected if PlanSpec has a confidence field.
+    Escalation: when allow_escalation (default True) and this role has an
+    escalation_ladders entry (models.yaml), a TruncatedOutputError or
+    confidence=="low" result walks to the ladder's next model instead of
+    failing outright. require_confirmation flips that to raising
+    EscalationNeeded instead of silently retrying — nodes set this from
+    state["human_in_the_loop"] — see EscalationNeeded's docstring.
+    current_model_override resumes a ladder walk that already escalated
+    earlier in this run, rather than restarting from the top.
+    profile="ultra" skips the walk and starts straight at the ladder's
+    final entry; any other profile just changes the STARTING model via
+    routing.yaml's pipeline_profiles.<profile>.role_overrides.
 
-    MODE B — Explicit messages (legacy / multi-turn flows):
-        call_role(
-            role="classify",
-            messages=explicit_messages,
-            response_schema=TaskClassification,
-            stage="classify",
-            run_dir=run_dir,
-        )
-        Messages are used as-is. YAML system prompt is prepended if no
-        system message is present in the provided list.
+    Returns: a response_schema instance. If escalation happened, it also
+    carries `_escalated_from`/`_escalated_to` model_id attributes (set via
+    object.__setattr__; both None otherwise) — node files read these back
+    to update state["escalated_models"]/state["escalation_history"].
 
-    AGENTIC TOOL CALLING (either mode — pass tools= and tool_impls=):
-        call_role(
-            role="plan",
-            template_vars={"task": task_text, ...},   # no search_block needed
-            response_schema=PlanSpec,
-            stage="plan",
-            run_dir=run_dir,
-            thinking=True,
-            tools=[SEARCH_TOOL_SCHEMA],
-            tool_impls=TOOL_IMPLEMENTATIONS,
-        )
-        When tools is non-empty, call_role returns ONLY the parsed
-        response_schema instance (same return shape as the non-tool path)
-        — the tool_call_history that call_model_with_tools() also produces
-        is available via call_role_with_tool_history() if a caller wants
-        it; call_role itself discards it to keep this function's return
-        type consistent for every existing call site. tool_impls defaults
-        to clients.tools.TOOL_IMPLEMENTATIONS if tools is set but
-        tool_impls isn't, so passing just tools=[...] with the standard
-        registry works without also importing/passing TOOL_IMPLEMENTATIONS
-        by hand.
-
-    Args:
-        role:            Role name from models.yaml roles section.
-        messages:        Explicit message list (Mode B). If None, template_vars required.
-        response_schema: Pydantic model to parse response into.
-        stage:           Stage name for logging. Defaults to role if not provided.
-        run_dir:         Run directory path for logs.
-        thinking:        Override thinking mode. None = use YAML/model default.
-        budget_tokens:   Override thinking budget. None = use YAML/routing.yaml value.
-        max_retries:     Instructor retry count.
-        template_vars:   Dict of variables to render into YAML templates (Mode A).
-        extra_messages:  Additional turns appended after system+user (both modes).
-        tools:           Tool schemas (OpenAI tools= format) to expose to the
-                          model for this call. None/empty = no tool calling,
-                          identical behaviour to before this parameter existed.
-        tool_impls:      name -> callable(args: dict) -> str. Defaults to
-                          clients.tools.TOOL_IMPLEMENTATIONS when tools is set.
-        max_tool_rounds: Cap on tool-call round-trips before forcing a final
-                          answer. See call_model_with_tools's docstring.
-        tool_history_sink: Optional list the caller owns. When tools= is set
-                          and this is given, it is REPLACED IN PLACE with the
-                          ToolCallRecord list from the call that produced the
-                          returned result (so if escalation re-dispatches,
-                          the last dispatch wins). Lets a node keep what was
-                          searched/returned — call_role itself still returns
-                          ONLY the parsed schema object — WITHOUT switching
-                          to call_role_with_tool_history(), which bypasses
-                          profile/escalation/require_confirmation handling.
-                          Ignored when tools is empty.
-        profile:         Active pipeline_profiles name for this run (routing.yaml).
-                          "ultra" resolves this role straight to
-                          resolve_ultra_model(role) up front (ladder's final
-                          entry), bypassing the normal roles:/escalation walk
-                          below entirely — ultra runs don't discover their
-                          way to the ceiling one truncation at a time.
-                          Any other profile just uses its role_overrides
-                          (pipeline_profiles.<profile>.role_overrides in
-                          routing.yaml) in place of roles: as the STARTING
-                          model, same as before. None = behave exactly like
-                          the pre-profile default (use roles: as-is).
-        current_model_override: If this stage has already escalated earlier
-                          in the SAME run (state["escalated_models"][stage]),
-                          pass that model_id here so a second escalation
-                          event continues walking the ladder from where it
-                          left off instead of restarting from the profile's
-                          starting model. None = start from profile/roles:.
-        allow_escalation: Set False to disable the escalation walk for this
-                          call entirely (e.g. a role with no ladder, or a
-                          caller that wants the old raise-immediately
-                          behaviour). Defaults True.
-        require_confirmation: When allow_escalation would otherwise fire
-                          (TruncatedOutputError, or confidence=="low"),
-                          raise EscalationNeeded instead of silently
-                          calling the next model. Nodes set this from
-                          state["human_in_the_loop"] (design doc §2.6,
-                          corrected: "ask if unsure" gates escalation
-                          itself, not just the final halt after the
-                          ladder's exhausted) — see EscalationNeeded's
-                          docstring for the full node-side flow. Ignored
-                          if allow_escalation=False or there's no next
-                          model on this role's ladder (nothing to confirm).
-        **kwargs:        Forwarded to call_model() (e.g. skip_nowait, compress_system).
-                          Not used on the tools= path (call_model_with_tools
-                          doesn't accept compress_system/skip_nowait today).
-
-    Returns:
-        Populated instance of response_schema. If escalation occurred
-        during this call, the returned instance carries two extra
-        attributes (set via object.__setattr__ since Pydantic models are
-        normally immutable-by-field-set): `_escalated_from` (the model_id
-        the call started on) and `_escalated_to` (the model_id it
-        succeeded on), both None if no escalation happened. Node files
-        that care (currently just classifier.py/planner.py, the two
-        confidence-bearing stages) read these back to update
-        state["escalated_models"]/state["escalation_history"]; every
-        other call site can ignore them exactly as before.
+    **kwargs are forwarded to call_model() (e.g. skip_nowait,
+    compress_system) — unused on the tools= path.
     """
     stage    = stage or role
 
@@ -1484,53 +1549,46 @@ def call_role(
     else:
         model_id = resolve_role(role)
         if profile:
-            try:
-                cfg = _load_config()
-                routing_path = Path(__file__).parent.parent / "config" / "routing.yaml"
-                with open(routing_path) as f:
-                    routing_cfg = yaml.safe_load(f) or {}
-                overrides = (
-                    routing_cfg.get("pipeline_profiles", {})
-                    .get(profile, {})
-                    .get("role_overrides", {})
-                )
-                if role in overrides:
-                    model_id = overrides[role]
-                    log.debug("Profile '%s': role '%s' overridden to '%s'", profile, role, model_id)
-            except Exception:
-                log.warning("Could not read pipeline_profiles for profile '%s' — using roles: default", profile)
+            overrides = (
+                get_routing_config().get("pipeline_profiles", {})
+                .get(profile, {})
+                .get("role_overrides", {})
+            )
+            if role in overrides:
+                model_id = overrides[role]
+                log.debug("Profile '%s': role '%s' overridden to '%s'", profile, role, model_id)
 
     # ── Custom pipeline per-step overrides ────────────────────────────────
-    # Set by pipeline/custom_graph.py._wrap_existing_node when a custom
-    # pipeline reuses a built-in node but wants a different model/budget
-    # than that node's normal role assignment. Scoped to a single node
-    # call via a context-managed env var, not a persistent config change.
-    # Takes precedence over ultra remapping — an explicit per-step override
-    # in a custom pipeline definition is a more specific instruction than
-    # the global ultra mode toggle.
-    step_model_override = os.environ.get("PIPELINE_STEP_MODEL_OVERRIDE")
+    # Set by pipeline/custom_graph.py._wrap_existing_node (via step_overrides()
+    # above) when a custom pipeline reuses a built-in node but wants a
+    # different model/budget than that node's normal role assignment.
+    # Scoped to a single node call, not a persistent config change. Takes
+    # precedence over ultra remapping — an explicit per-step override in a
+    # custom pipeline definition is a more specific instruction than the
+    # global ultra mode toggle.
+    step_model_override = _step_model_override.get()
     if step_model_override:
         log.debug("Custom pipeline override: role '%s' -> model '%s'", role, step_model_override)
         model_id = step_model_override
-    step_budget_override = os.environ.get("PIPELINE_STEP_BUDGET_OVERRIDE")
+    step_budget_override = _step_budget_override.get()
     if step_budget_override is not None:
-        budget_tokens = int(step_budget_override)
+        budget_tokens = step_budget_override
 
     # ── Truncation-retry output cap override ──────────────────────────────
-    # Set by graph.py's node-retry wrapper (_wrap_node_for_truncation_retry)
-    # for exactly one call: re-running a node that just raised
-    # TruncatedOutputError, with a higher max_tokens than routing.yaml's
-    # output_token_caps.<stage> would normally allow. Distinct from
-    # PIPELINE_STEP_BUDGET_OVERRIDE above, which only affects the
+    # Set by graph.py's node-retry wrapper (_wrap_node_for_truncation_retry,
+    # via step_overrides() above) for exactly one call: re-running a node
+    # that just raised TruncatedOutputError, with a higher max_tokens than
+    # routing.yaml's output_token_caps.<stage> would normally allow.
+    # Distinct from the budget override above, which only affects the
     # *thinking* budget — the output cap (max_tokens on the completion
     # call, the thing that actually causes finish_reason="length") is a
     # separate value read via _get_output_token_cap(stage) inside
-    # call_model, so bumping budget_tokens alone would not have fixed a
-    # truncation caused by the output cap.
+    # call_model, so bumping the thinking budget alone would not have
+    # fixed a truncation caused by the output cap.
     output_cap_override = kwargs.pop("output_cap_override", None)
-    step_output_cap_override = os.environ.get("PIPELINE_STEP_OUTPUT_CAP_OVERRIDE")
+    step_output_cap_override = _step_output_cap_override.get()
     if output_cap_override is None and step_output_cap_override is not None:
-        output_cap_override = int(step_output_cap_override)
+        output_cap_override = step_output_cap_override
 
     # ── Resolve thinking mode from YAML if not explicitly overridden ─────────
     # budget_tokens intentionally NOT read from YAML — routing.yaml is the
@@ -1587,6 +1645,12 @@ def call_role(
     starting_model_id = model_id
     escalated_to: Optional[str] = None
 
+    if response_schema is None:
+        # call_model()/call_model_with_tools() both require a schema (Instructor
+        # can't parse without one). Fail loudly and early instead of deep inside.
+        raise ValueError(f"call_role('{role}', stage='{stage}') requires response_schema=")
+    _schema: Type[T] = response_schema
+
     def _dispatch(mid: str):
         if tools:
             impls = tool_impls
@@ -1598,7 +1662,7 @@ def call_role(
                 messages        = final_messages,
                 tools           = tools,
                 tool_impls      = impls,
-                response_schema = response_schema,
+                response_schema = _schema,
                 stage           = stage,
                 run_dir         = run_dir,
                 thinking        = thinking,
@@ -1613,7 +1677,7 @@ def call_role(
         return call_model(
             model_id        = mid,
             messages        = final_messages,
-            response_schema = response_schema,
+            response_schema = _schema,
             stage           = stage,
             run_dir         = run_dir,
             thinking        = thinking,
@@ -1711,7 +1775,50 @@ def call_role(
     return result
 
 
-def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecord"]]:
+def call_role_with_repair(
+    role:         str,
+    repair_hint:  str = "Please output valid JSON.",
+    max_attempts: int = 3,
+    **call_role_kwargs,
+) -> T:  # pyright: ignore[reportInvalidTypeVarUse]
+    """
+    call_role() wrapped in a retry loop for when the model's ENTIRE answer
+    fails to parse — a malformed top-level payload, not just a field
+    call_role's own Instructor-level repair already handles internally.
+    Feeds the validation error back as a corrective follow-up turn and
+    tries again. TruncatedOutputError is never retried here — it
+    propagates immediately so pipeline/graph.py's generic truncation-retry
+    wrapper can handle it (a token-cap truncation isn't a JSON problem;
+    the same cap plus a "please output valid JSON" nudge won't help).
+
+    repair_hint: role-specific guidance appended to the correction message
+    (e.g. bugfix_node's reminder that search_text/replace_text must be
+    valid escaped JSON strings). call_role_kwargs are passed straight
+    through to call_role() — extra_messages, if given, seeds the first
+    attempt and is then replaced by the correction turn on retries.
+    """
+    extra_messages = call_role_kwargs.pop("extra_messages", None) or []
+    label = call_role_kwargs.get("stage", role)
+
+    for attempt in range(max_attempts):
+        try:
+            return call_role(role, extra_messages=extra_messages or None, **call_role_kwargs)
+        except TruncatedOutputError:
+            raise
+        except Exception as e:
+            log.warning("%s: output validation failed (attempt %d/%d): %s", label, attempt + 1, max_attempts, e)
+            if attempt == max_attempts - 1:
+                raise RuntimeError(f"{label} failed to produce valid output after {max_attempts} attempts.") from e
+            extra_messages = [
+                {"role": "assistant", "content": "I provided malformed JSON."},
+                {"role": "user",      "content": f"Your previous output failed validation:\n{e}\n\n{repair_hint}"},
+            ]
+
+    # Unreachable: the final attempt above either returns or raises.
+    raise RuntimeError(f"{label}: call_role_with_repair exited retry loop unexpectedly")
+
+
+def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecord"]]:  # pyright: ignore[reportInvalidTypeVarUse]
     """
     Same as call_role(role, ..., tools=[...]), but also returns the
     ToolCallRecord history (which tools were called, with what arguments,
@@ -1739,6 +1846,12 @@ def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecor
 
     model_id = resolve_role(role)
     stage    = kwargs.get("stage") or role
+    response_schema_arg = kwargs.get("response_schema")
+    if response_schema_arg is None:
+        raise ValueError(
+            f"call_role_with_tool_history('{role}') requires response_schema= "
+            f"(call_model_with_tools can't parse a final answer without one)."
+        )
     tool_impls = kwargs.get("tool_impls")
     if tool_impls is None:
         from clients.tools import TOOL_IMPLEMENTATIONS as _default_tool_impls
@@ -1754,14 +1867,14 @@ def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecor
         final_messages = build_messages_from_prompt(
             role            = role,
             template_vars   = kwargs.get("template_vars") or {},
-            response_schema = kwargs.get("response_schema"),
+            response_schema = response_schema_arg,
             extra_messages  = kwargs.get("extra_messages"),
         )
     else:
         has_system = any(m.get("role") == "system" for m in messages)
         if not has_system and prompt_def.get("system"):
             system_text = _safe_format(prompt_def["system"], kwargs.get("template_vars") or {})
-            response_schema = kwargs.get("response_schema")
+            response_schema = response_schema_arg
             if response_schema and _schema_has_confidence(response_schema):
                 system_text = system_text.rstrip() + "\n" + _CONFIDENCE_INSTRUCTION
             messages = [{"role": "system", "content": system_text}] + messages
@@ -1775,7 +1888,7 @@ def call_role_with_tool_history(*args, **kwargs) -> tuple[T, list["ToolCallRecor
         messages        = final_messages,
         tools           = tools,
         tool_impls      = tool_impls,
-        response_schema = kwargs.get("response_schema"),
+        response_schema = response_schema_arg,
         stage           = stage,
         run_dir         = kwargs.get("run_dir", ""),
         thinking        = thinking,

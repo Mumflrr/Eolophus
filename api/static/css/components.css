@@ -460,3 +460,22 @@ textarea.textarea-input { resize: vertical; min-height: 92px; font-family: var(-
 @media (max-width: 860px) {
   #toast-root { left: 14px; right: 14px; bottom: 74px; max-width: none; }
 }
+
+#run-body {
+  display: flex;
+  flex-direction: column;
+  gap: 28px;               /* was probably ~16px; try 24–32 */
+}
+
+/* Sections currently space themselves; zero that out so gaps don't stack */
+#run-body > .card,
+#run-body > .chat-drawer {
+  margin-top: 0;
+  margin-bottom: 0;
+}
+
+/* The two empty mount points (clarify / truncate) are children too;
+   hide them when empty so they don't add a phantom gap at the top */
+#run-body > :empty {
+  display: none;
+}

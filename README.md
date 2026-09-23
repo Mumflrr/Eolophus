@@ -150,3 +150,9 @@ is fully tested against the mock's simulated stage progression, but
 obviously can't verify real inference quality either. `api_contract.md`
 also still doesn't document `/pipelines/*` — this repo's `api.js` and
 this README are the interim reference until that's updated.
+
+Future tasks
+- Artifacts
+- Improve runDetails UI
+- Overhaul pipelines
+- Test custom pipelines

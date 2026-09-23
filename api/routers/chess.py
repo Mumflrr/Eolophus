@@ -28,7 +28,7 @@ async def chess_analyse(req: ChessRequest):
     # visible import anywhere in that file — presumably imported at module
     # level somewhere that wasn't in view, or injected via `from x import *`.
     # Update this import path to wherever it actually lives.
-    from analysis.chess import analyse_chess_move  # underlying analysis function
+    from nodes.chess import analyse_chess_move  # underlying analysis function
 
     run_uuid = str(uuid.uuid4())
     run_dir  = RUNS_DIR / "chess" / run_uuid

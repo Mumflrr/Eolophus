@@ -38,11 +38,11 @@ async def update_budgets(req: BudgetPatch):
 @router.post("/config/reload")
 async def reload_config():
     """Bust all in-memory config caches. Call after manual YAML edits."""
-    from clients.llm import _config_cache, _prompt_cache
-    _config_cache.clear()
+    from config.loader import reload_config as _reload_yaml_config
+    from clients.llm import _prompt_cache
+    _reload_yaml_config()
     _prompt_cache.clear()
     return {"status": "reloaded"}
-
 
 @router.get("/config/searxng")
 async def get_searxng_url():

@@ -23,6 +23,7 @@ import json
 import logging
 import time
 from pathlib import Path
+from typing import Any
 
 from openai import OpenAI
 from clients.model_manager import ensure_model_loaded
@@ -30,7 +31,8 @@ from clients.llm import (
     get_model_config, load_prompt, resolve_role, resolve_ultra_model,
     _write_thinking_log, _extract_thinking_partial,
     _log_stage_entry, _get_thinking_budget, _get_http_timeout,
-    _get_output_token_cap, TruncatedOutputError, ToolCallRecord,
+    _get_output_token_cap, TruncatedOutputError, ToolCallRecord, _build_logit_bias,
+    _build_thinking_extra_body, _stream_completion, check_cancelled,
 )
 from clients.tools import (
     SEARCH_HINT, SEARCH_TOOL_SCHEMA, TOOL_IMPLEMENTATIONS, format_search_notes,
@@ -126,20 +128,20 @@ def describe_node(state: dict) -> dict:
     # combined, so this must stay comfortably above budget (currently 512)
     # or the answer itself can get truncated once thinking eats into the cap.
     #
-    # PIPELINE_STEP_OUTPUT_CAP_OVERRIDE takes precedence when set — this is
-    # how the truncation-retry wrapper re-runs this exact node with a
-    # higher cap after a TruncatedOutputError (see graph.py). Read via
-    # os.environ directly here since describe_node doesn't go through
-    # call_role/call_model, which is where that env var is normally
-    # consulted (clients/llm.py's call_role).
-    import os
-    _cap_override = os.environ.get("PIPELINE_STEP_OUTPUT_CAP_OVERRIDE")
-    max_tokens = int(_cap_override) if _cap_override is not None else _get_output_token_cap("describe")
+    # The truncation-retry wrapper (graph.py) re-runs this exact node with
+    # a higher cap after a TruncatedOutputError, via step_overrides()
+    # (clients/llm.py) — read directly here since describe_node doesn't go
+    # through call_role/call_model, where it's normally consulted.
+    from clients.llm import _step_output_cap_override
+    _cap_override = _step_output_cap_override.get()
+    max_tokens = _cap_override if _cap_override is not None else _get_output_token_cap("describe")
 
+    check_cancelled()   # don't swap models for a run that's already been cancelled
     try:
         ensure_model_loaded(model_id_key)
     except Exception as e:
         log.warning("model_manager failed: %s — assuming %s already running", e, model_id_key)
+    check_cancelled()   # cancel may have landed during the swap
 
     raw_client = OpenAI(
         # Previously hardcoded to timeout=300.0 — same bug as the one fixed
@@ -161,92 +163,174 @@ def describe_node(state: dict) -> dict:
         {"role": "user",   "content": user_text},
     ]
 
-    extra_body = {
-        "thinking": {"type": "enabled", "budget_tokens": budget}
-    } if budget > 0 else {
-        "thinking": {"type": "disabled"}
-    }
+    # ── Request shape ─────────────────────────────────────────────────────
+    # describe builds its own client, so it has to send everything call_model /
+    # call_model_with_tools send or it quietly runs with less protection than
+    # every other node. It was missing four things:
+    #   - top_p               (cfg, default 0.95 — both call paths pass it)
+    #   - reasoning_budget    (the parameter llama.cpp reads; the Anthropic-style
+    #                          thinking={budget_tokens} key alone is ignored by
+    #                          llama.cpp, which is why the "512" here never bound)
+    #   - logit_bias NoWait   (models.yaml nowait_tokens; suppresses the "Wait…"
+    #                          self-doubt loops a thinking Qwen falls into — the
+    #                          reason call_model applies it to every node)
+    #   - presence_penalty    (models.yaml presence_penalty; was declared on 35b
+    #                          with the comment "prevents infinite loops in <think>
+    #                          tags" but never actually read by ANY call site in
+    #                          the codebase, so it did nothing even there. NoWait
+    #                          above stops a specific self-doubt pattern in
+    #                          thinking; this is the general guard against plain
+    #                          content-level repetition — e.g. a free-text answer
+    #                          that degenerates into repeating "|" forever, which
+    #                          NoWait suppression does nothing for)
+    # Unlike the JSON-schema nodes, which stop when the object closes, describe
+    # is free text — max_tokens is still the last line of defense, but it
+    # shouldn't be the only one.
+    top_p             = cfg.get("top_p", 0.95)
+    presence_penalty  = cfg.get("presence_penalty")
+    nowait_bias       = _build_logit_bias(cfg)
 
-    working_messages = list(messages)   # grows with tool turns; `messages` stays
-                                        # as system+user for the prompt hash
+    def _request_extra_body(thinking_on: bool) -> dict:
+        # The shared builder (clients/llm.py) — the same one call_model and
+        # call_model_with_tools use, so the three can't drift apart again.
+        body = _build_thinking_extra_body(thinking_on, budget)
+        if nowait_bias:
+            body["logit_bias"] = nowait_bias
+        return body
+
     tool_history: list[ToolCallRecord] = []
-    tokens_out_total = 0
-    rounds = 0
+    stats = {"tokens_out": 0, "rounds": 0, "reasoning_chars": 0}
+
+    def _generate(thinking_on: bool):
+        """
+        One full generation: the tool loop (when search is on), then the answer.
+        Returns (raw_content, finish_reason, usage). Called once normally, and
+        a second time with thinking disabled if the first ran away in thinking.
+        """
+        tool_history.clear()                     # a retry starts from a clean slate
+        extra_body       = _request_extra_body(thinking_on)
+        working_messages = list(messages)        # grows with tool turns; `messages`
+                                                 # stays system+user for the prompt hash
+        rounds = 0
+        while True:
+            check_cancelled()
+            rounds += 1
+            stats["rounds"] += 1
+            force_final = bool(call_tools) and rounds > _MAX_TOOL_ROUNDS
+
+            create_kwargs: dict[str, Any] = dict(
+                model       = model_id,
+                messages    = working_messages,
+                temperature = cfg.get("temperature", 0.6),
+                top_p       = top_p,
+                max_tokens  = max_tokens,   # None = unbounded, matches prior behaviour
+                extra_body  = extra_body,
+            )
+            if presence_penalty is not None:
+                create_kwargs["presence_penalty"] = presence_penalty
+            if call_tools:
+                create_kwargs["tools"]       = call_tools
+                create_kwargs["tool_choice"] = "none" if force_final else "auto"
+
+            if not call_tools:
+                # No tools to accumulate, so stream via the shared helper: a cancel
+                # aborts mid-generation (closing the stream makes llama-server stop)
+                # instead of waiting out a blocking request of up to `max_tokens`.
+                reasoning_sink: list = []
+                content, usage, _ttft, _think, n_chunks, finish = _stream_completion(
+                    raw_client, model_id, working_messages, create_kwargs["temperature"],
+                    top_p, extra_body, "describe", max_tokens=max_tokens,
+                    reasoning_sink=reasoning_sink, presence_penalty=presence_penalty,
+                )
+                stats["tokens_out"] += usage.completion_tokens if usage else n_chunks
+                reasoning = "".join(reasoning_sink)
+                if reasoning:
+                    stats["reasoning_chars"] += len(reasoning)
+                    _write_thinking_log(run_dir, "describe", reasoning)
+                return content, finish, usage
+
+            resp  = raw_client.chat.completions.create(**create_kwargs)
+            # Non-streaming (tool-calling) request: a cancel that landed during it is
+            # noticed here, before any tool runs or another round is issued.
+            check_cancelled()
+            msg   = resp.choices[0].message
+            usage = resp.usage
+            if usage:
+                stats["tokens_out"] += usage.completion_tokens
+
+            # llama.cpp puts thinking on tool-calling responses in a separate
+            # reasoning_content field rather than <think> tags in content (see
+            # call_model_with_tools' docstring) — log it per round.
+            reasoning = getattr(msg, "reasoning_content", None) or ""
+            if reasoning:
+                stats["reasoning_chars"] += len(reasoning)
+                _write_thinking_log(run_dir, "describe", reasoning)
+
+            if call_tools and msg.tool_calls and not force_final:
+                log.info("[describe] round %d: model requested %d tool call(s)",
+                         rounds, len(msg.tool_calls))
+                working_messages.append(msg.model_dump(exclude_none=True))
+                for tc in msg.tool_calls:
+                    tool_name = tc.function.name
+                    try:
+                        tool_args = json.loads(tc.function.arguments or "{}")
+                    except json.JSONDecodeError as e:
+                        log.warning("[describe] tool call %s had unparseable arguments (%s): %r",
+                                    tool_name, e, tc.function.arguments)
+                        tool_args = {}
+
+                    impl = TOOL_IMPLEMENTATIONS.get(tool_name)
+                    if impl is None:
+                        result_text = f"Error: unknown tool '{tool_name}'."
+                        log.warning("[describe] model called unregistered tool '%s'", tool_name)
+                    else:
+                        try:
+                            result_text = impl(tool_args)
+                        except Exception as e:
+                            # Best-effort, same as call_model_with_tools: hand
+                            # the error back as the tool result so the model can
+                            # answer without it instead of crashing the node.
+                            log.warning("[describe] tool '%s' raised: %s", tool_name, e)
+                            result_text = f"Error running tool: {e}"
+
+                    tool_history.append(ToolCallRecord(
+                        name=tool_name, arguments=tool_args, result=result_text,
+                    ))
+                    working_messages.append({
+                        "role":         "tool",
+                        "tool_call_id": tc.id,
+                        "content":      result_text,
+                    })
+                continue   # go again with the tool results in context
+
+            # No tool calls (or a forced final answer) — this is the answer.
+            return msg.content or "", resp.choices[0].finish_reason, usage
 
     start_ts = time.perf_counter()
+    raw_content, finish_reason, usage = _generate(thinking_on=budget > 0)
+    truncated = finish_reason == "length"
 
-    while True:
-        rounds += 1
-        force_final = bool(call_tools) and rounds > _MAX_TOOL_ROUNDS
-
-        create_kwargs = dict(
-            model       = model_id,
-            messages    = working_messages,
-            temperature = cfg.get("temperature", 0.6),
-            max_tokens  = max_tokens,   # None = unbounded, matches prior behaviour
-            extra_body  = extra_body,
+    # ── Runaway-thinking recovery ─────────────────────────────────────────
+    # Cap hit with NO answer at all means it never got out of the thinking
+    # phase (a "Wait…" loop). Retrying with the same settings and a bigger cap
+    # (what the truncation-retry wrapper would offer) just loops for longer, so
+    # try once more with thinking off — describe is a direct-answer node, and
+    # an unthought answer beats a 16k-token failure. A truncation that DID
+    # produce answer text is a genuinely long answer and still raises below.
+    thinking_block, answer, _ = _extract_thinking_partial(raw_content)
+    if truncated and budget > 0 and not answer.strip():
+        log.warning(
+            "[describe] hit the %s-token cap without leaving the thinking phase "
+            "(%d chars reasoning, %d chars in-content thinking; budget %d was not "
+            "enforced) — retrying once with thinking disabled",
+            max_tokens, stats["reasoning_chars"], len(thinking_block), budget,
         )
-        if call_tools:
-            create_kwargs["tools"]       = call_tools
-            create_kwargs["tool_choice"] = "none" if force_final else "auto"
-
-        resp = raw_client.chat.completions.create(**create_kwargs)
-        msg   = resp.choices[0].message
-        usage = resp.usage
-        if usage:
-            tokens_out_total += usage.completion_tokens
-
-        # llama.cpp puts thinking on tool-calling responses in a separate
-        # reasoning_content field rather than <think> tags in content (see
-        # call_model_with_tools' docstring) — log it per round.
-        reasoning = getattr(msg, "reasoning_content", None) or ""
-        if reasoning:
-            _write_thinking_log(run_dir, "describe", reasoning)
-
-        if call_tools and msg.tool_calls and not force_final:
-            log.info("[describe] round %d: model requested %d tool call(s)",
-                     rounds, len(msg.tool_calls))
-            working_messages.append(msg.model_dump(exclude_none=True))
-            for tc in msg.tool_calls:
-                tool_name = tc.function.name
-                try:
-                    tool_args = json.loads(tc.function.arguments or "{}")
-                except json.JSONDecodeError as e:
-                    log.warning("[describe] tool call %s had unparseable arguments (%s): %r",
-                                tool_name, e, tc.function.arguments)
-                    tool_args = {}
-
-                impl = TOOL_IMPLEMENTATIONS.get(tool_name)
-                if impl is None:
-                    result_text = f"Error: unknown tool '{tool_name}'."
-                    log.warning("[describe] model called unregistered tool '%s'", tool_name)
-                else:
-                    try:
-                        result_text = impl(tool_args)
-                    except Exception as e:
-                        # Best-effort, same as call_model_with_tools: hand
-                        # the error back as the tool result so the model can
-                        # answer without it instead of crashing the node.
-                        log.warning("[describe] tool '%s' raised: %s", tool_name, e)
-                        result_text = f"Error running tool: {e}"
-
-                tool_history.append(ToolCallRecord(
-                    name=tool_name, arguments=tool_args, result=result_text,
-                ))
-                working_messages.append({
-                    "role":         "tool",
-                    "tool_call_id": tc.id,
-                    "content":      result_text,
-                })
-            continue   # go again with the tool results in context
-
-        # No tool calls (or a forced final answer) — this is the answer.
-        raw_content   = msg.content or ""
-        finish_reason = resp.choices[0].finish_reason
-        break
+        if thinking_block:
+            _write_thinking_log(run_dir, "describe", thinking_block)
+        raw_content, finish_reason, usage = _generate(thinking_on=False)
+        truncated = finish_reason == "length"
 
     elapsed_ms  = (time.perf_counter() - start_ts) * 1000
-    truncated   = finish_reason == "length"
 
     # Use the truncation-aware extractor (handles an <think> block left
     # open with no closing tag — the common case when the cap lands
@@ -265,8 +349,11 @@ def describe_node(state: dict) -> dict:
     _log_stage_entry(
         run_dir, "describe", cfg["name"], prompt_hash,
         usage.prompt_tokens     if usage else 0,
-        tokens_out_total,
+        stats["tokens_out"],
         elapsed_ms, "truncated" if truncated else "ok", 0,
+        think_ratio = round(
+            (stats["reasoning_chars"] + len(thinking_block)) /
+            max(stats["reasoning_chars"] + len(thinking_block) + len(answer), 1), 3),
     )
 
     if truncated:
@@ -307,9 +394,10 @@ def describe_node(state: dict) -> dict:
             partial_answer=answer,
         )
 
-    log.info("[describe] answered in %.0fms (%d tool round(s), %d search call(s))",
-             elapsed_ms, rounds, len(tool_history))
+    log.info("[describe] answered in %.0fms (%d round(s), %d search call(s))",
+             elapsed_ms, stats["rounds"], len(tool_history))
 
+    check_cancelled()   # don't write a final answer for a cancelled run
     output_path = str(Path(run_dir) / "final.json")
     Path(output_path).write_text(
         json.dumps({"answer": answer, "task_type": "describe"}, indent=2),

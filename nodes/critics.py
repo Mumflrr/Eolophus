@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 from clients.llm import call_role
+from nodes._shared import derive_task_tags, record_escalation
 from pipeline.state import PipelineState
 from schemas.validation import (
     CritiqueVerdict, CritiqueRecord, CriticScope, VerdictCategory, ValidationVerdict
@@ -57,20 +58,7 @@ def critic_a_node(state: PipelineState) -> dict:
         current_model_override = current_model_override,
     )
 
-    escalated_models   = dict(state.get("escalated_models") or {})
-    escalation_history = list(state.get("escalation_history") or [])
-    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(verdict, "_escalated_from", None)
-        escalated_models["critic_a"] = escalated_to_attr
-        escalation_history.append({
-            "stage":      "critic_a",
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "truncation",
-            "iteration":  state.get("iteration", 0),
-        })
-        log.info("Critic A escalated %s → %s", escalated_from_attr, escalated_to_attr)
+    escalated_models, escalation_history = record_escalation(state, "critic_a", verdict)
 
     verdict = verdict.model_copy(update={
         "critic_model": "qwen3.5-9b",
@@ -131,20 +119,7 @@ def critic_b_node(state: PipelineState) -> dict:
         current_model_override = current_model_override,
     )
 
-    escalated_models   = dict(state.get("escalated_models") or {})
-    escalation_history = list(state.get("escalation_history") or [])
-    escalated_to_attr  = getattr(verdict, "_escalated_to", None)
-    if escalated_to_attr:
-        escalated_from_attr = getattr(verdict, "_escalated_from", None)
-        escalated_models["critic_b"] = escalated_to_attr
-        escalation_history.append({
-            "stage":      "critic_b",
-            "from_model": escalated_from_attr,
-            "to_model":   escalated_to_attr,
-            "trigger":    "truncation",
-            "iteration":  state.get("iteration", 0),
-        })
-        log.info("Critic B escalated %s → %s", escalated_from_attr, escalated_to_attr)
+    escalated_models, escalation_history = record_escalation(state, "critic_b", verdict)
 
     verdict = verdict.model_copy(update={
         "critic_model": "deepcoder-14b",
@@ -178,11 +153,15 @@ def _accumulate_verdict(
         return existing.model_copy(update={"critic_verdicts": updated_verdicts})
 
     appraisal = state.get("appraisal_report")
+    plan      = state.get("plan_spec")
+    task_type = state.get("task_type", "coding")
+    tags = derive_task_tags(task_type, plan.moe_routing_context if plan else "")
+
     return CritiqueRecord(
         run_uuid                 = state["run_uuid"],
         iteration                = state.get("iteration", 0),
-        task_type                = state.get("task_type", "coding"),
-        task_tags                = _derive_tags(state),
+        task_type                = task_type,
+        task_tags                = tags,
         appraisal_critical_count = appraisal.critical_count if appraisal else 0,
         appraisal_major_count    = appraisal.major_count    if appraisal else 0,
         iq2s_inherited_issues    = appraisal.iq2s_inherited_issues if appraisal else [],
@@ -204,15 +183,3 @@ def _accumulate_verdict(
         total_iterations = state.get("iteration", 0) + 1,
         loops_triggered  = state.get("iteration", 0),
     )
-
-
-def _derive_tags(state: PipelineState) -> list[str]:
-    tags = [state.get("task_type", "coding")]
-    plan = state.get("plan_spec")
-    if plan and plan.moe_routing_context:
-        ctx = plan.moe_routing_context.lower()
-        for kw in ["python", "fastapi", "async", "django", "typescript",
-                   "react", "database", "rest", "docker", "testing"]:
-            if kw in ctx:
-                tags.append(kw)
-    return list(set(tags))
