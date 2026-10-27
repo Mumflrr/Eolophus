@@ -1,152 +1,115 @@
-# Eolophus Pipeline GUI
+# Eolophus
 
-A dependency-free web GUI for the Eolophus pipeline API — no npm install,
-no build step. Plain HTML/CSS/JS (ES modules), drops straight into
-`api/static/`.
+Eolophus is a sophisticated, locally-run LLM orchestration pipeline designed for tackling complex tasks through a graph-based execution model. It features a modular architecture, multi-LLM support, a self-correction loop with a "lesson-learning" mechanism, and a dependency-free web UI for monitoring, interaction, and custom pipeline creation.
 
-## Run it
+## Key Features
 
-```
-pip install fastapi uvicorn[standard]
-uvicorn api.mock_server:app --reload
-```
+*   **Graph-Based Execution:** Utilizes LangGraph to define and execute complex task workflows as a stateful graph of interconnected nodes.
+*   **Modular Node Architecture:** Tasks are broken down into discrete, reusable nodes, including classification, planning, drafting, appraisal, bug-fixing, and a multi-critic ensemble.
+*   **Multi-LLM Strategy:** Assigns distinct roles to different models (e.g., Qwen for generation, DeepCoder for code analysis) and uses escalation ladders to dynamically switch to more powerful models when tasks prove difficult.
+*   **Self-Correction & Learning:** Employs a critique and validation loop to iteratively improve generated output. It distills successful corrections into "lessons" stored in a SQLite database to enhance future performance on similar tasks.
+*   **Custom Pipelines:** A YAML-based definition schema and a powerful web-based visual editor allow you to create and manage custom execution graphs beyond the built-in flow.
+*   **CLI and Web Interface:** Interact with the pipeline via a comprehensive CLI (`run.py`) for scriptable execution or a dependency-free web UI for submitting tasks, monitoring live progress, managing models, and building pipelines.
+*   **Integrated Capabilities:** Includes built-in support for vision (analyzing image inputs) and web search (using a local SearXNG instance) to ground its responses and analysis.
+*   **Observability:** Integrates with Langfuse for detailed tracing and observability of pipeline runs.
 
-Open `http://localhost:8000`. When real backend access is available, stop
-`mock_server` and run `uvicorn api.server:app --reload` instead — the
-frontend needs zero changes, since both servers expose the identical
-`/pipelines/*` and other contracts.
+## Architecture Overview
 
-If you run the GUI from somewhere other than the FastAPI server itself,
-open **Settings** and change the API base URL (stored in `localStorage`,
-defaults to `http://localhost:8000`).
+The repository is structured into several key directories:
 
-## Layout
+*   `api/`: Contains the FastAPI server, all API endpoint logic, and the static assets for the web UI.
+*   `clients/`: Provides wrappers for interacting with LLMs (`llm.py`), managing model server processes (`model_manager.py`), and external tools like web search (`search.py`).
+*   `config/`: Home to all declarative configuration, including model definitions (`models.yaml`), pipeline routing logic (`routing.yaml`), and prompt templates for each node (`prompts/`).
+*   `nodes/`: Implements the individual processing steps (nodes) of the pipeline, such as `classify_node`, `plan_node`, and `draft_node`.
+*   `pipeline/`: Defines the LangGraph execution graph (`graph.py`), custom pipeline compiler (`custom_graph.py`), routing functions, and core state management.
+*   `schemas/`: Contains all Pydantic models that define the data structures passed between nodes.
+*   `storage/`: Manages the SQLite database for storing run history, critique records, and learned lessons.
 
-```
-api/
-  mock_server.py     ← now includes /pipelines/* CRUD (see below) — replace
-                        your copy with this one, or diff and merge by hand
-  static/
-    index.html
-    css/
-      tokens.css        design tokens
-      base.css           reset + app shell + icon baseline
-      components.css      card, buttons, badges, forms, connection pill, toasts
-      timeline.css         run-detail stage timeline, run-list rows, lesson cards
-      pipelineEditor.css    the pipeline canvas: nodes, edges, inspector panel
-    js/
-      api.js            one function per endpoint, including /pipelines/*
-      app.js             shell + hash router
-      pipelineLayout.js   pure layout engine for the canvas (unit-tested separately)
-      format.js            duration/date/number formatting, status-color mapping
-      icons.js              small hand-rolled outline icon set
-      toast.js               toast notifications
-      ambient.js               background gradient's Ultra-mode crossfade
-      components/
-        health.js             persistent connection indicator, polls /health
-        quickRun.js            top-bar "start a run" pulse button
-        card.js                 shared card/empty-state/loading markup
-      views/
-        runs.js               task submission (incl. pipeline picker) + live run list
-        runDetail.js            live stage timeline via SSE, clarification, artifacts
-        models.js                model list, load/unload, role reassignment
-        pipelines.js              saved-pipeline list: browse/create/delete
-        pipelineEditor.js          the node-graph canvas editor
-        lessons.js                 lesson browser
-        settings.js                 API base URL, SearXNG, config reload,
-                                     built-in pipeline's stage budgets
+## Getting Started
+
+### 1. Installation
+
+Clone the repository and install the required Python dependencies.
+
+```bash
+git clone https://github.com/mumflrr/eolophus.git
+cd eolophus
+pip install -r requirements.txt
 ```
 
-No React, no bundler, no external JS dependencies at runtime — fetches
-Space Grotesk / IBM Plex Sans / IBM Plex Mono from Google Fonts, falls
-back to system fonts cleanly if offline.
+### 2. Configuration
 
-## Design
+Copy the example environment file and customize it for your local setup.
 
-Follows `design_reference.md`: pure black base, diagonal blue→purple
-gradient wash (crossfading toward indigo/purple in Ultra mode), frosted-
-glass cards, pill buttons, monospaced data. Icons are a small hand-rolled
-outline set with one consistent baseline size and stroke weight — no
-external icon library.
+```bash
+cp .env.example .env
+```
 
-The pipeline canvas follows the handoff doc's explicit color guidance:
-existing/freeform/decision node types each get a distinct left-border
-accent (blue/green/purple), decision nodes lean into the purple
-"analysis mode" accent as the most structurally interesting node type,
-and loop-back edges render dashed, curved, and orange — visually distinct
-from the solid blue forward-flow edges.
+You will need to edit `.env` to specify `MODEL_DIR`, which is the directory where your GGUF model files are stored. You may also configure the database path and Langfuse credentials.
 
-**Node positions are not part of the saved data model** — there's no x/y
-field anywhere in `PipelineDefinition`. The canvas computes a fresh
-layered auto-layout from graph structure every time (same reachability
-walk the backend's own validator does), and nodes are draggable within a
-session for readability, but dragging is never persisted. That's a
-deliberate choice to avoid inventing client-side state the server has
-nowhere to keep — flagging it explicitly rather than silently faking
-position persistence.
+### 3. Database Initialization
 
-## Testing
+The pipeline uses a SQLite database to store its state. The database and its schema will be created automatically the first time you run the application (either via the CLI or the web server).
 
-Everything was exercised against a **live** `mock_server.py` — not mocked
-responses — using jsdom + real `fetch` + real `EventSource`:
+## Usage
 
-- **53-check full regression suite** covering every view: submission,
-  live SSE stage streaming with no duplicate nodes, the clarification
-  pause/resume cycle, model role reassignment, budget persistence
-  (verified server-side), lesson deletion (verified server-side), run
-  cancellation, and routing/unmount safety.
-- **30-check pipeline editor suite**: create a pipeline, add all three
-  step types, wire a decision's outcomes, trigger the loop-cap prompt on
-  a backward drag exactly as the handoff doc asked for, live debounced
-  validation reaching a clean "valid" state, save, reload from the server
-  and confirm round-trip fidelity, run a real execution against the
-  custom pipeline, delete.
-- **15 unit tests** for the pure layout engine (`pipelineLayout.js`)
-  against the handoff doc's own `test_loop` example, plus edge cases:
-  orphaned/unreachable steps, dangling edge targets, self-loops, and
-  backward `edge_overrides`.
+You can interact with the Eolophus pipeline through its command-line interface or the web UI.
 
-## A real bug found in the backend, not the mock
+### Command-Line Interface
 
-While testing loop caps against the handoff doc's own `test_loop` example,
-I found a genuine logic bug in `pipeline/custom_nodes.py`'s
-`make_decision_router`, in the `if count >= cap:` block. Once a decision
-step's visit count reaches its cap, the router force-reroutes to a
-*different* outcome than whatever the model actually decided —
-**unconditionally**, without first checking whether the raw decision
-already exits the loop. So if a loop's model correctly decides "pass" on
-exactly the visit that happens to also be the capped one, the cap logic
-still overrides it and forces the *looping* branch instead — backward
-from the intent. It only behaves correctly when the raw decision at the
-cap boundary happens to already be the looping one, which is the common
-case but not guaranteed.
+The primary entry point is `run.py`. It accepts a task description and numerous flags to control its behavior.
 
-I ported the exact current (buggy) behavior into the mock's
-custom-pipeline simulator (`_simulate_custom_pipeline_run` in
-`mock_server.py`), since the mock's job is to faithfully mirror what
-`server.py` actually does — not a hypothetical fixed version. If this
-gets fixed in the real backend, update the mock's simulator to match.
+**Basic Usage:**
+```bash
+python run.py "implement a FastAPI endpoint that returns the current time"
+```
 
-## Two earlier mock quirks (`mock_server.py`, non-blocking)
+**Specifying Modes and Task Types:**
+```bash
+# Force the long, more thorough pipeline mode
+python run.py --mode long "design a multi-tenant authentication system"
 
-Neither is a contract violation, both worth knowing:
+# Provide an image for vision analysis
+python run.py --image ./mockup.png "implement this UI in HTML and CSS"
+```
 
-1. **`completed_at` never gets set** on a finished built-in-pipeline run —
-   stays `null` forever. The run list falls back to `total_latency_ms`
-   for duration, so this doesn't show up in the UI.
-2. **Role reassignment doesn't actually change what `GET /models`
-   returns afterward** in the original (non-pipeline) mock fixtures — the
-   GUI works around this with an optimistic client-side layer that's
-   harmless against the real `server.py` too.
+**Inline Prefix Syntax:**
+You can also use a shorthand prefix syntax directly in your task description to control the pipeline's behavior. CLI flags will always take precedence.
 
-Nothing in `server.py` itself needed changing for either.
+*   `/long <task>`: Force long mode.
+*   `/short <task>`: Force short mode.
+*   `/no-ensemble <task>`: Skip the critique ensemble for a faster run.
+*   `/long/coding <task>`: Force both long mode and the "coding" task type.
 
-## Custom pipelines — what's genuinely done vs. not
+**Example with Prefix:**
+```bash
+python run.py "/long/ideation explore different approaches for a real-time collaboration tool"
+```
 
-Per the handoff doc's own caveat, model-output quality on a real creative
-pipeline with live models hasn't been tested by anyone — the backend
-graph mechanics were verified with model calls stubbed out. The GUI side
-is fully tested against the mock's simulated stage progression, but
-obviously can't verify real inference quality either. `api_contract.md`
-also still doesn't document `/pipelines/*` — this repo's `api.js` and
-this README are the interim reference until that's updated.
+### Web UI
+
+The web UI provides a rich interface for submitting and monitoring runs, managing models, and creating custom pipelines.
+
+1.  **Start the API Server:**
+    ```bash
+    uvicorn api.server:app --reload --host 0.0.0.0 --port 8000
+    ```
+
+2.  **Access the UI:**
+    Open your browser and navigate to `http://localhost:8000`.
+
+The UI is a dependency-free, pure HTML/CSS/JS application that communicates with the FastAPI backend. It allows you to:
+*   Submit new tasks with attachments and configuration options.
+*   Watch the progress of a run in real-time through a stage-by-stage timeline.
+*   Interact with a run that has paused for clarification.
+*   Browse run artifacts, chat history, and learned lessons.
+*   Manage model configurations and assign roles.
+*   Create, edit, and delete custom pipelines with a visual node-graph editor.
+
+## Configuration
+
+Eolophus is highly configurable through YAML files located in the `config/` directory.
+
+*   `models.yaml`: Defines all available LLMs, their server configurations (ports, launch flags), and their assigned roles within the pipeline (e.g., which model handles `classify` vs. `appraise`). It also specifies escalation ladders for each role.
+*   `routing.yaml`: Controls the pipeline's routing logic, including thinking token budgets for each stage, correction loop limits, and triggers for the critique ensemble.
+*   `prompts/`: Contains a YAML file for each node, defining the system prompt and user message templates used for that stage.
